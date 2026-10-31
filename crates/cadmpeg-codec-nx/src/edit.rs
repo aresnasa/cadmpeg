@@ -52,6 +52,9 @@ pub enum EditError {
     /// A required CFB stream is absent.
     #[error("missing stream: {0}")]
     MissingStream(String),
+    /// The container header or directory is malformed.
+    #[error("malformed container: {0}")]
+    MalformedContainer(String),
     /// The `part/attrs` payload is not the expected XML document.
     #[error("invalid part/attrs XML: {0}")]
     InvalidAttributeXml(String),
@@ -68,9 +71,37 @@ pub enum EditError {
 /// This is a small, side-effect-free read used by the editor and by tests. It
 /// does not open the NX object model.
 pub fn read_part_attributes(path: &Path) -> Result<Vec<PartAttribute>, EditError> {
+    let bytes = fs::read(path)?;
+    if bytes.starts_with(b"SPLMSSTR") {
+        let (offset, length) = splmsstr_attrs_span(&bytes)?;
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| EditError::MalformedContainer("part/attrs span exceeds file".into()))?;
+        return parse_attributes(&bytes[offset..end]);
+    }
     let mut compound = cfb::open(path)?;
     let xml = read_stream(&mut compound, PART_ATTRS_STREAM)?;
     parse_attributes(&xml)
+}
+
+fn splmsstr_attrs_span(bytes: &[u8]) -> Result<(usize, usize), EditError> {
+    let container = crate::container::scan_bytes(bytes)
+        .map_err(|error| EditError::MalformedContainer(error.to_string()))?;
+    let entry = container
+        .entries
+        .iter()
+        .find(|entry| entry.name == "/Root/part/attrs" || entry.name == "part/attrs")
+        .ok_or_else(|| EditError::MissingStream(PART_ATTRS_STREAM.to_string()))?;
+    let (offset, length) = entry
+        .file_span()
+        .ok_or_else(|| EditError::MissingStream(PART_ATTRS_STREAM.to_string()))?;
+    Ok((
+        usize::try_from(offset)
+            .map_err(|_| EditError::MalformedContainer("offset overflow".into()))?,
+        usize::try_from(length)
+            .map_err(|_| EditError::MalformedContainer("length overflow".into()))?,
+    ))
 }
 
 /// Set one part attribute and write the result to `output`.
@@ -86,11 +117,12 @@ pub fn set_part_attribute(
 ) -> Result<EditReport, EditError> {
     let source_bytes = fs::read(input)?;
     let source_sha256 = sha256_hex(&source_bytes);
+    if source_bytes.starts_with(b"SPLMSSTR") {
+        return set_splmsstr_attribute(input, output, &source_bytes, title, value, source_sha256);
+    }
     if source_bytes.len() < 8 || source_bytes[..8] != CFB_MAGIC {
         return Err(EditError::UnsupportedContainer(
-            "only legacy CFB .prt files are writable in this milestone; \
-             SPLMSSTR writing is not implemented"
-                .to_string(),
+            "only legacy CFB and SPLMSSTR .prt files are supported".to_string(),
         ));
     }
     if input == output {
@@ -155,6 +187,116 @@ pub fn set_part_attribute(
         source_sha256,
         output_sha256,
         byte_identical,
+    })
+}
+
+fn set_splmsstr_attribute(
+    input: &Path,
+    output: &Path,
+    source_bytes: &[u8],
+    title: &str,
+    value: &str,
+    source_sha256: String,
+) -> Result<EditReport, EditError> {
+    let (offset, length) = {
+        let container = crate::container::scan_bytes(source_bytes)
+            .map_err(|error| EditError::MalformedContainer(error.to_string()))?;
+        let entry = container
+            .entries
+            .iter()
+            .find(|entry| entry.name == "/Root/part/attrs" || entry.name == "part/attrs")
+            .ok_or_else(|| EditError::MissingStream(PART_ATTRS_STREAM.to_string()))?;
+        let (offset, length) = entry
+            .file_span()
+            .ok_or_else(|| EditError::MissingStream(PART_ATTRS_STREAM.to_string()))?;
+        (
+            usize::try_from(offset)
+                .map_err(|_| EditError::MalformedContainer("offset overflow".into()))?,
+            usize::try_from(length)
+                .map_err(|_| EditError::MalformedContainer("length overflow".into()))?,
+        )
+    };
+    let end = offset
+        .checked_add(length)
+        .filter(|end| *end <= source_bytes.len())
+        .ok_or_else(|| EditError::MalformedContainer("part/attrs span exceeds file".into()))?;
+    let old_xml = &source_bytes[offset..end];
+    let (new_xml, changed) = rewrite_attribute(old_xml, title, value)?;
+
+    if !changed {
+        let temp = temporary_path(output);
+        if let Err(error) = fs::copy(input, &temp) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        replace_file(&temp, output)?;
+        let output_bytes = fs::read(output)?;
+        let output_sha256 = sha256_hex(&output_bytes);
+        return Ok(EditReport {
+            source: input.to_path_buf(),
+            output: output.to_path_buf(),
+            changed_streams: Vec::new(),
+            source_sha256,
+            output_sha256,
+            byte_identical: true,
+        });
+    }
+
+    if new_xml.len() > length {
+        return Err(EditError::UnsupportedContainer(format!(
+            "SPLMSSTR in-place edit cannot grow part/attrs from {length} to {} bytes; \
+             a container repack is required",
+            new_xml.len()
+        )));
+    }
+
+    let mut output_bytes = source_bytes.to_vec();
+    output_bytes[offset..offset + new_xml.len()].copy_from_slice(&new_xml);
+    let padding = if old_xml.last().copied() == Some(0) {
+        0
+    } else {
+        b' '
+    };
+    output_bytes[offset + new_xml.len()..end].fill(padding);
+
+    let temp = temporary_path(output);
+    if let Err(error) = fs::write(&temp, &output_bytes) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    replace_file(&temp, output)?;
+
+    // Re-scan and read the edited stream before returning.
+    let written = fs::read(output)?;
+    {
+        let container = crate::container::scan_bytes(written.as_slice())
+            .map_err(|error| EditError::MalformedContainer(error.to_string()))?;
+        let entry = container
+            .entries
+            .iter()
+            .find(|entry| entry.name == "/Root/part/attrs" || entry.name == "part/attrs")
+            .ok_or_else(|| EditError::MissingStream(PART_ATTRS_STREAM.to_string()))?;
+        let (offset, length) = entry
+            .file_span()
+            .ok_or_else(|| EditError::MissingStream(PART_ATTRS_STREAM.to_string()))?;
+        let offset = usize::try_from(offset)
+            .map_err(|_| EditError::MalformedContainer("offset overflow".into()))?;
+        let length = usize::try_from(length)
+            .map_err(|_| EditError::MalformedContainer("length overflow".into()))?;
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= written.len())
+            .ok_or_else(|| EditError::MalformedContainer("part/attrs span exceeds file".into()))?;
+        parse_attributes(&written[offset..end])?;
+    }
+
+    Ok(EditReport {
+        source: input.to_path_buf(),
+        output: output.to_path_buf(),
+        changed_streams: vec![PART_ATTRS_STREAM.to_string()],
+        source_sha256,
+        output_sha256: sha256_hex(&written),
+        byte_identical: false,
     })
 }
 
@@ -235,7 +377,6 @@ fn rewrite_attribute(xml: &[u8], title: &str, value: &str) -> Result<(Vec<u8>, b
     if let Some(tag) = existing {
         let mut attributes = tag.attributes.clone();
         let mut has_value = false;
-        let uses_utf8 = attributes.iter().any(|(name, _)| name == "utf8title");
         for (name, attribute_value) in &mut attributes {
             match name.as_str() {
                 "title" | "utf8title" => *attribute_value = title.to_string(),
@@ -248,9 +389,6 @@ fn rewrite_attribute(xml: &[u8], title: &str, value: &str) -> Result<(Vec<u8>, b
         }
         if !has_value {
             attributes.push(("value".to_string(), value.to_string()));
-        }
-        if uses_utf8 && !attributes.iter().any(|(name, _)| name == "utf8value") {
-            attributes.push(("utf8value".to_string(), value.to_string()));
         }
         output.push_str(&text[..tag.start]);
         output.push_str(&render_tag("Attribute", &attributes));
