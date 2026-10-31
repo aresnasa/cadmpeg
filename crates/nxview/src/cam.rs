@@ -21,15 +21,25 @@ pub enum MoveKind {
 #[allow(dead_code)]
 pub struct CamMove {
     pub id: u32,
+    pub section: usize,
     pub kind: MoveKind,
     /// End point in millimetres (NX legacy Path records store mm here).
     pub end: [f64; 3],
     pub center: Option<[f64; 3]>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CamSection {
+    pub index: usize,
+    pub stream_offset: usize,
+    pub moves: usize,
+    pub operations: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct CamPart {
     pub path_sections: usize,
+    pub sections: Vec<CamSection>,
     pub moves: Vec<CamMove>,
     pub operations: Vec<String>,
 }
@@ -102,9 +112,21 @@ pub fn load(path: &Path) -> anyhow::Result<CamPart> {
                     section_started.elapsed()
                 );
             }
+            let index = part.sections.len();
+            let move_count = section.moves.len();
+            let mut section = section;
+            for mv in &mut section.moves {
+                mv.section = index;
+            }
             part.path_sections += 1;
             part.moves.extend(section.moves);
-            part.operations.extend(section.operations);
+            part.operations.extend(section.operations.iter().cloned());
+            part.sections.push(CamSection {
+                index,
+                stream_offset: offset,
+                moves: move_count,
+                operations: section.operations,
+            });
         } else if debug {
             eprintln!("  rejected section took={:?}", section_started.elapsed());
         }
@@ -218,6 +240,7 @@ fn parse_path_section(data: &[u8], offset: usize) -> Option<Section> {
                 if let Some(end) = point_at(record, 7) {
                     moves.push(CamMove {
                         id,
+                        section: 0,
                         kind: MoveKind::Linear,
                         end,
                         center: None,
@@ -228,6 +251,7 @@ fn parse_path_section(data: &[u8], offset: usize) -> Option<Section> {
                 if let Some(end) = point_at(record, 7) {
                     moves.push(CamMove {
                         id,
+                        section: 0,
                         kind: MoveKind::Circular,
                         end,
                         center: point_at(record, 55),
@@ -238,6 +262,7 @@ fn parse_path_section(data: &[u8], offset: usize) -> Option<Section> {
                 if let Some(end) = point_at(record, 7) {
                     moves.push(CamMove {
                         id,
+                        section: 0,
                         kind: MoveKind::Helical,
                         end,
                         center: point_at(record, 55),

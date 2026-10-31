@@ -23,6 +23,7 @@ struct MeshData {
     normals: Vec<[f32; 3]>,
     indices: Vec<u32>,
     cam_points: Vec<[f32; 3]>,
+    cam_sections: Vec<usize>,
     faces_tessellated: usize,
     faces_refused: usize,
 }
@@ -163,6 +164,12 @@ fn main() -> anyhow::Result<()> {
                 min[0], min[1], min[2], max[0], max[1], max[2]
             );
             println!("operations={:?}", cam.operations);
+            for section in &cam.sections {
+                println!(
+                    "  section {} offset={:#x} moves={} operations={:?}",
+                    section.index, section.stream_offset, section.moves, section.operations
+                );
+            }
             let ply_path = PathBuf::from(
                 path.file_name()
                     .unwrap_or_default()
@@ -303,6 +310,7 @@ fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
                 .iter()
                 .map(|mv| [mv.end[0] as f32, mv.end[1] as f32, mv.end[2] as f32])
                 .collect();
+            mesh.cam_sections = cam.moves.iter().map(|mv| mv.section).collect();
             println!(
                 "CAM: sections={} moves={} operations={:?}",
                 cam.path_sections,
@@ -398,6 +406,7 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
         render_software(
             mesh,
             &mesh.cam_points,
+            &mesh.cam_sections,
             width,
             height,
             target,
@@ -417,6 +426,7 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
 fn render_software(
     mesh: &MeshData,
     cam_points: &[[f32; 3]],
+    cam_sections: &[usize],
     width: usize,
     height: usize,
     target: Vec3,
@@ -524,7 +534,13 @@ fn render_software(
 
     // CAM toolpath move endpoints. A small depth bias keeps them visible on
     // top of the CAD surface they are cutting.
-    for point in cam_points {
+    const CAM_COLORS: [u32; 8] = [
+        0x00ffb347, 0x004fc3f7, 0x0081c784, 0x00ba68c8, 0x00ffd54f, 0x004db6ac, 0x00ff8a65,
+        0x009575cd,
+    ];
+    for (move_index, point) in cam_points.iter().enumerate() {
+        let section = cam_sections.get(move_index).copied().unwrap_or(0);
+        let color = CAM_COLORS[section % CAM_COLORS.len()];
         let clip = mvp * Vec4::new(point[0], point[1], point[2], 1.0);
         if clip.w <= 1e-6 {
             continue;
@@ -549,7 +565,7 @@ fn render_software(
                 let offset = py as usize * width + px as usize;
                 if depth < zbuf[offset] {
                     zbuf[offset] = depth;
-                    buffer[offset] = 0x00ffb347;
+                    buffer[offset] = color;
                 }
             }
         }
