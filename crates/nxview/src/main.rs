@@ -15,11 +15,14 @@ use glam::camera::rh::{proj::opengl, view};
 use glam::{Vec3, Vec4};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
+mod cam;
+
 #[derive(Default)]
 struct MeshData {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     indices: Vec<u32>,
+    cam_points: Vec<[f32; 3]>,
     faces_tessellated: usize,
     faces_refused: usize,
 }
@@ -134,10 +137,41 @@ fn main() -> anyhow::Result<()> {
             let path = args.next().context("usage: nxview view <part.prt>")?;
             let path = PathBuf::from(path);
             let mesh = load_mesh(&path, chord(0.5))?;
-            if mesh.indices.is_empty() {
-                bail!("{} has no renderable B-rep or JT geometry", path.display());
+            if mesh.indices.is_empty() && mesh.cam_points.is_empty() {
+                bail!(
+                    "{} has no renderable B-rep, JT, or CAM geometry",
+                    path.display()
+                );
             }
             view(&path, &mesh)?;
+        }
+        "cam" => {
+            let path = args.next().context("usage: nxview cam <part.prt>")?;
+            let path = PathBuf::from(path);
+            let cam = cam::load(&path)?;
+            let (min, max) = cam.bounds();
+            println!(
+                "path-sections={} moves={} linear={} circular={} helical={}",
+                cam.path_sections,
+                cam.moves.len(),
+                cam.linear(),
+                cam.circular(),
+                cam.helical()
+            );
+            println!(
+                "bbox=({}, {}, {})..({}, {}, {})",
+                min[0], min[1], min[2], max[0], max[1], max[2]
+            );
+            println!("operations={:?}", cam.operations);
+            let ply_path = PathBuf::from(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .with_extension("cam.ply");
+            cam.write_ply(&ply_path)?;
+            println!("wrote {}", ply_path.display());
         }
         other => {
             // Treat the first argument as a path for convenience.
@@ -262,12 +296,29 @@ fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
         }
     }
 
+    if let Ok(cam) = cam::load(path) {
+        if !cam.moves.is_empty() {
+            mesh.cam_points = cam
+                .moves
+                .iter()
+                .map(|mv| [mv.end[0] as f32, mv.end[1] as f32, mv.end[2] as f32])
+                .collect();
+            println!(
+                "CAM: sections={} moves={} operations={:?}",
+                cam.path_sections,
+                cam.moves.len(),
+                cam.operations
+            );
+        }
+    }
+
     println!(
-        "render mesh: faces={} refused={} vertices={} triangles={}",
+        "render mesh: faces={} refused={} vertices={} triangles={} cam-points={}",
         mesh.faces_tessellated,
         mesh.faces_refused,
         mesh.positions.len(),
-        mesh.indices.len() / 3
+        mesh.indices.len() / 3,
+        mesh.cam_points.len()
     );
     Ok(mesh)
 }
@@ -289,7 +340,9 @@ fn write_obj(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
 }
 
 fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
-    let (min, max, center) = view_bounds(&mesh.positions);
+    let mut bounds_positions = mesh.positions.clone();
+    bounds_positions.extend(mesh.cam_points.iter().copied());
+    let (min, max, center) = view_bounds(&bounds_positions);
     let target = Vec3::from(center);
     let extent = (max[0] - min[0])
         .max(max[1] - min[1])
@@ -344,6 +397,7 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
 
         render_software(
             mesh,
+            &mesh.cam_points,
             width,
             height,
             target,
@@ -362,6 +416,7 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn render_software(
     mesh: &MeshData,
+    cam_points: &[[f32; 3]],
     width: usize,
     height: usize,
     target: Vec3,
@@ -463,6 +518,39 @@ fn render_software(
                 let g = (base.y * shade * 255.0).clamp(0.0, 255.0) as u32;
                 let b = (base.z * shade * 255.0).clamp(0.0, 255.0) as u32;
                 buffer[offset] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
+    // CAM toolpath move endpoints. A small depth bias keeps them visible on
+    // top of the CAD surface they are cutting.
+    for point in cam_points {
+        let clip = mvp * Vec4::new(point[0], point[1], point[2], 1.0);
+        if clip.w <= 1e-6 {
+            continue;
+        }
+        let inv_w = 1.0 / clip.w;
+        let x = (clip.x * inv_w * 0.5 + 0.5) * width as f32;
+        let y = (1.0 - (clip.y * inv_w * 0.5 + 0.5)) * height as f32;
+        let z = clip.z * inv_w * 0.5 + 0.5;
+        if !(0.0..=1.0).contains(&z) || x < 0.0 || y < 0.0 {
+            continue;
+        }
+        let depth = (z - 0.0008).max(0.0);
+        let xi = x as isize;
+        let yi = y as isize;
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let px = xi + dx;
+                let py = yi + dy;
+                if px < 0 || py < 0 || px >= width as isize || py >= height as isize {
+                    continue;
+                }
+                let offset = py as usize * width + px as usize;
+                if depth < zbuf[offset] {
+                    zbuf[offset] = depth;
+                    buffer[offset] = 0x00ffb347;
+                }
             }
         }
     }

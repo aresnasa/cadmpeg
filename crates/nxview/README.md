@@ -18,6 +18,7 @@ require the NX application, and the file format is decoded from bytes only.
 | Legacy CFB `facetted_hood.prt` | 18 bodies, 93 faces, 266 edges; **48 faces tessellated / 45 refused** |
 | Legacy CFB `glass.prt` | 7 surfaces, 6 curves; topology graph incomplete, no face mesh |
 | Legacy CFB assembly `ufun_disp_mattex6_test.prt` | external child-part references; legacy JT index decoded, geometry is JT type-31/ULP and not yet meshed |
+| Legacy CFB CAM `hsm_setup.prt` | 8 Path OM sections, **25,124 moves** (7,627 linear / 17,449 circular / 48 helical); operations `RESTMILL_ALL`, `ZLEVEL_POSTS`; CAM points overlay in the viewer |
 
 The 45 refusals are concentrated in faces whose loops do not close in the
 surface parameter plane or whose procedural edge has no evaluable parameter.
@@ -49,7 +50,15 @@ nxview obj part.prt
 
 # Open an interactive orbit viewer
 nxview view part.prt
+
+# Extract NX CAM move endpoints from legacy CFB Path OM sections
+nxview cam part.prt
 ```
+
+`cam` writes `<name>.cam.ply` (millimetre point cloud) and reports the
+`PATH_3x_linear` / `PATH_3x_circular` / `PATH_3x_helical` move counts and
+operation-like names. `view` overlays the same CAM points in orange on the CAD
+mesh.
 
 Controls in the viewer: left-drag orbit, wheel zoom, Esc close.
 
@@ -99,8 +108,9 @@ NXVIEW_CHORD=2.0 nxview view part.prt
   type-31/ULP geometry needs a decoder.
 - **P1 assembly** — external references and placement frames are retained;
   child-part resolution and occurrence transforms are not yet composed.
-- **P2 CAM** — NX CAM setup/toolpath object-model records need dedicated
-  extraction; no toolpath evaluation is planned in this crate.
+- **P2 CAM** — legacy Path OM sections: 3D move extraction and overlay done
+  (point cloud). Operation ordering, circular/helical arc interpolation, tool
+  and setup records, and modern SPLMSSTR Path sections remain.
 - **P2 CAE** — mesh/solver/result records are separate object-model families;
   the current IR has no FEM arena.
 - **P3 UI** — out of scope for file opening. NX UI state is stored in streams;

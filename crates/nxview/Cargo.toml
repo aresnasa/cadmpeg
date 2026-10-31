@@ -12,5 +12,6 @@ anyhow.workspace = true
 cadmpeg-codec-nx.workspace = true
 cadmpeg-ir.workspace = true
 cadmpeg-tessellate.workspace = true
+cfb = "0.15"
 glam = "0.34"
 minifb = "0.29"
