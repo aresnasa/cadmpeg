@@ -19,6 +19,7 @@ require the NX application, and the file format is decoded from bytes only.
 | Legacy CFB `glass.prt` | 7 surfaces, 6 curves; topology graph incomplete, no face mesh |
 | Legacy CFB assembly `ufun_disp_mattex6_test.prt` | external child-part references; legacy JT index decoded, geometry is JT type-31/ULP and not yet meshed |
 | Legacy CFB CAM `hsm_setup.prt` | 8 Path OM sections, **25,124 moves** (7,627 linear / 17,449 circular / 48 helical); operations `RESTMILL_ALL`, `ZLEVEL_POSTS`; CAM points overlay in the viewer |
+| Modern SPLMSSTR `PCB Standoff.prt` | 3 bodies / 32 faces; 29 faces tessellated; opens in the viewer |
 
 The 45 refusals are concentrated in faces whose loops do not close in the
 surface parameter plane or whose procedural edge has no evaluable parameter.
