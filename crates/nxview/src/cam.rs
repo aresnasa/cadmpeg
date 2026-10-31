@@ -64,6 +64,9 @@ impl CamPart {
             .count()
     }
     pub fn bounds(&self) -> ([f64; 3], [f64; 3]) {
+        if self.moves.is_empty() {
+            return ([0.0; 3], [0.0; 3]);
+        }
         let mut min = [f64::INFINITY; 3];
         let mut max = [f64::NEG_INFINITY; 3];
         for mv in &self.moves {

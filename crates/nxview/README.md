@@ -56,9 +56,9 @@ nxview cam part.prt
 ```
 
 `cam` writes `<name>.cam.ply` (millimetre point cloud) and reports the
-`PATH_3x_linear` / `PATH_3x_circular` / `PATH_3x_helical` move counts and
-operation-like names. `view` overlays the same CAM points in orange on the CAD
-mesh.
+`PATH_3x_linear` / `PATH_3x_circular` / `PATH_3x_helical` move counts,
+operation-like names, and per-Path-section offsets. `view` overlays the same
+CAM points on the CAD mesh, colored per Path section.
 
 Controls in the viewer: left-drag orbit, wheel zoom, Esc close.
 

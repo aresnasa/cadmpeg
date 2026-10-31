@@ -102,6 +102,14 @@ fn compute_normals(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<[f32; 
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        // minifb does not set DPI awareness. Without this, a 1100x700 window
+        // is scaled to 2200x1400 physical pixels on a 200% display and the
+        // model appears outside the visible screen area.
+        windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
+    }
+
     let mut args = std::env::args().skip(1);
     let first = args.next().unwrap_or_else(|| "info".to_string());
     match first.as_str() {
@@ -350,8 +358,19 @@ fn write_obj(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
 fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
     let mut bounds_positions = mesh.positions.clone();
     bounds_positions.extend(mesh.cam_points.iter().copied());
-    let (min, max, center) = view_bounds(&bounds_positions);
-    let target = Vec3::from(center);
+    let (min, max, _center) = view_bounds(&bounds_positions);
+    let mut mean = [0.0_f64; 3];
+    for position in &bounds_positions {
+        for axis in 0..3 {
+            mean[axis] += f64::from(position[axis]);
+        }
+    }
+    let count = bounds_positions.len().max(1) as f64;
+    let target = Vec3::new(
+        (mean[0] / count) as f32,
+        (mean[1] / count) as f32,
+        (mean[2] / count) as f32,
+    );
     let extent = (max[0] - min[0])
         .max(max[1] - min[1])
         .max(max[2] - min[2])
@@ -370,7 +389,7 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
 
     let mut yaw = 0.65_f32;
     let mut pitch = 0.35_f32;
-    let mut distance = extent * 3.2;
+    let mut distance = extent * 4.0;
     let mut buffer: Vec<u32> = Vec::new();
     let mut zbuf: Vec<f32> = Vec::new();
     let mut last_mouse: Option<(f32, f32)> = None;
@@ -452,6 +471,14 @@ fn render_software(
     let view_matrix = view::look_at_mat4(eye, target, Vec3::Y);
     let projection = opengl::perspective(45_f32.to_radians(), aspect, near, far);
     let mvp = projection * view_matrix;
+    if std::env::var("NXVIEW_PROJ_DEBUG").is_ok() {
+        let clip = mvp * Vec4::new(target.x, target.y, target.z, 1.0);
+        eprintln!(
+            "target={target:?} eye={eye:?} extent={extent} clip={clip:?} screen=({}, {})",
+            (clip.x / clip.w * 0.5 + 0.5) * width as f32,
+            (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * height as f32
+        );
+    }
 
     let mut screen = vec![Vec3::ZERO; mesh.positions.len()];
     let mut visible = vec![false; mesh.positions.len()];
