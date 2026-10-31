@@ -11,7 +11,7 @@ use cadmpeg_core::decode::WorkBudget;
 use cadmpeg_ir::eval::admission::EvaluationAdmission;
 use cadmpeg_ir::eval::decode::pcurve_uv;
 use cadmpeg_ir::eval::{finite_or_refusal, model_curve_point_by_id, nurbs_curve_parameter_domain};
-use cadmpeg_ir::geometry::{PlacedCurve, SolvedCurveGeometry};
+use cadmpeg_ir::geometry::{PlacedCurve, ProceduralCurveDefinition, SolvedCurveGeometry};
 use cadmpeg_ir::ids::CurveId;
 use cadmpeg_ir::index::{ModelIndex, StandardIndex};
 use cadmpeg_ir::math::Point3;
@@ -155,6 +155,39 @@ impl Sampler<'_, '_> {
         Ok(Some(f64::midpoint(low, high)))
     }
 
+    /// The stored parameter interval of a procedural curve construction.
+    ///
+    /// A surface-intersection or surface-parametric carrier states its solved
+    /// interval in the construction context. A procedural carrier without a
+    /// solved cache still evaluates through that interval.
+    fn procedural_domain(&self, curve: &CurveId) -> Option<([f64; 2], bool)> {
+        let constructions = self
+            .index
+            .procedural_curves_for_curve(curve.as_str(), StandardIndex)?;
+        for construction in constructions {
+            let range = match construction.definition() {
+                ProceduralCurveDefinition::Intersection { context, .. } => {
+                    Some(context.parameter_range().endpoints())
+                }
+                ProceduralCurveDefinition::TolerantIntersection {
+                    parameterization: Some(parameterization),
+                    ..
+                } => Some(parameterization.parameter_range().endpoints()),
+                ProceduralCurveDefinition::SurfaceCurve { family } => {
+                    Some(family.context().parameter_range().endpoints())
+                }
+                ProceduralCurveDefinition::Subset(subset) => {
+                    Some(subset.parameter_range().endpoints())
+                }
+                _ => None,
+            };
+            if let Some(range) = range {
+                return Some((range, false));
+            }
+        }
+        None
+    }
+
     /// The parameter range of an edge, from the model or from its vertices.
     fn range(&self, edge: &Edge, curve: &CurveId) -> Result<[f64; 2], Refusal> {
         if let Some(range) = edge.param_range() {
@@ -172,8 +205,10 @@ impl Sampler<'_, '_> {
             let along = |point: Point3| dot(sub(point, origin), direction);
             return Ok([along(start), along(end)]);
         }
-        let (domain, periodic) = geometry
+        let domain = geometry
             .and_then(natural_domain)
+            .or_else(|| self.procedural_domain(curve));
+        let (domain, periodic) = domain
             .ok_or_else(|| Refusal::new(format!("the edge {} has no parameter range", edge.id)))?;
         let first = self
             .nearest(curve, start, domain)?

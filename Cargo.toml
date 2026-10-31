@@ -26,6 +26,7 @@ members = [
   "crates/cadmpeg-codec-sat",
   "crates/cadmpeg-codec-pvz",
   "crates/cadmpeg-codec-usd",
+  "crates/nxview",
 ]
 # cadmpeg-fuzz is intentionally excluded: cargo-fuzz targets link libFuzzer and
 # require a nightly toolchain, so keeping the crate out of the default workspace

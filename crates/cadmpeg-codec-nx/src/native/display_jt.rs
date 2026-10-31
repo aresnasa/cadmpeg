@@ -2840,6 +2840,115 @@ fn parse_jt9_material_body(body: &[u8]) -> Option<ParsedJt9Material> {
     ))
 }
 
+/// The one DisplayJT stream this legacy or modern part carries.
+///
+/// Modern parts name `/Root/UG_PART/DisplayJT`. Legacy CFB parts name either
+/// `UG_PART/DisplayJT` or `UG_PART/JT`; when both exist, the DisplayJT cache
+/// is preferred. The legacy `UG_PART/JT` index uses 4-byte id/offset rows.
+fn preferred_display_jt_entry<'a>(
+    container: &'a Container,
+) -> Option<&'a crate::container::DirEntry> {
+    container
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.name.as_str(),
+                "/Root/UG_PART/DisplayJT"
+                    | "UG_PART/DisplayJT"
+                    | "/Root/UG_PART/JT"
+                    | "UG_PART/JT"
+            )
+        })
+        .min_by_key(|entry| match entry.name.as_str() {
+            "/Root/UG_PART/DisplayJT" => 0,
+            "UG_PART/DisplayJT" => 1,
+            "/Root/UG_PART/JT" => 2,
+            "UG_PART/JT" => 3,
+            _ => 4,
+        })
+}
+
+fn is_preferred_display_jt(container: &Container, entry: &&crate::container::DirEntry) -> bool {
+    preferred_display_jt_entry(container).is_some_and(|preferred| std::ptr::eq(preferred, *entry))
+}
+
+/// Decode the legacy `UG_PART/JT` outer index:
+/// `version:u32, count:u32, zero:u32, (id:u32, header_offset:u32)[count]`.
+fn parse_legacy_display_jt_index(
+    ctx: &DecodeContext<'_>,
+    container: &Container,
+    entry: &crate::container::DirEntry,
+    index_ordinal: usize,
+) -> Result<Option<DisplayJtIndex>, CodecError> {
+    const JT_HEADER: &[u8] = b"Version ";
+    let Some((source_offset, byte_len)) = entry.file_span() else {
+        return Ok(None);
+    };
+    let Some(payload) = container.bounded_entry_bytes(source_offset, byte_len) else {
+        return Ok(None);
+    };
+    let (Some(version), Some(declared_count), Some(zero)) = (
+        View::u32_le_at(payload, 0),
+        View::u32_le_at(payload, 4),
+        View::u32_le_at(payload, 8),
+    ) else {
+        return Ok(None);
+    };
+    if zero != 0 {
+        return Ok(None);
+    }
+    let Ok(row_count) = usize::try_from(declared_count) else {
+        return Ok(None);
+    };
+    let Some(table_end) = row_count.checked_mul(8).and_then(|bytes| 12usize.checked_add(bytes))
+    else {
+        return Ok(None);
+    };
+    if row_count == 0 || table_end > payload.len() {
+        return Ok(None);
+    }
+    let mut rows = Vec::new();
+    let mut previous_header_offset = None;
+    for ordinal in 0..row_count {
+        let row_offset = 12 + ordinal * 8;
+        let Some(id) = View::u32_le_at(payload, row_offset).filter(|id| *id != 0) else {
+            return Ok(None);
+        };
+        let Some(header_offset) = View::u32_le_at(payload, row_offset + 4) else {
+            return Ok(None);
+        };
+        let header_offset_usize = usize::try_from(header_offset).unwrap_or(usize::MAX);
+        if header_offset_usize < table_end
+            || !payload
+                .get(header_offset_usize..)
+                .is_some_and(|tail| tail.starts_with(JT_HEADER))
+            || previous_header_offset.is_some_and(|previous| header_offset <= previous)
+        {
+            return Ok(None);
+        }
+        previous_header_offset = Some(header_offset);
+        ctx.charge_entities(1, "admit legacy DisplayJT index row")?;
+        rows.push(DisplayJtIndexRow {
+            id: format!("nx:display-jt:index#{index_ordinal}-row-{ordinal}"),
+            ordinal: u32::try_from(ordinal)
+                .map_err(|_| CodecError::malformed("DisplayJT index row ordinal exceeds u32"))?,
+            header_offset,
+            value: NonZeroU64::new(u64::from(id))
+                .ok_or_else(|| CodecError::malformed("legacy DisplayJT row id is zero"))?,
+            source_offset: source_offset + cadmpeg_core::decode::u64_from_index(row_offset),
+        });
+    }
+    ctx.charge_entities(1, "admit legacy DisplayJT index entity")?;
+    Ok(DisplayJtIndex::new(
+        format!("nx:display-jt:index#{index_ordinal}"),
+        version,
+        rows,
+        source_offset,
+    )
+    .ok())
+}
+
 /// Decode the complete outer index of each `/Root/UG_PART/DisplayJT` stream.
 pub(super) fn display_jt_indices(
     ctx: &DecodeContext<'_>,
@@ -2855,7 +2964,7 @@ pub(super) fn display_jt_indices(
     for (index_ordinal, entry) in container
         .entries
         .iter()
-        .filter(|entry| entry.name == "/Root/UG_PART/DisplayJT")
+        .filter(|entry| is_preferred_display_jt(container, entry))
         .enumerate()
     {
         let parsed = (|| -> Result<Option<DisplayJtIndex>, CodecError> {
@@ -2940,6 +3049,10 @@ pub(super) fn display_jt_indices(
             )
             .ok())
         })()?;
+        let parsed = match parsed {
+            Some(index) => Some(index),
+            None => parse_legacy_display_jt_index(ctx, container, entry, index_ordinal)?,
+        };
         if let Some(index) = parsed {
             indices.push(index);
         }
@@ -2956,7 +3069,7 @@ pub(super) fn display_jt_documents(
     let mut entries = container
         .entries
         .iter()
-        .filter(|entry| entry.name == "/Root/UG_PART/DisplayJT");
+        .filter(|entry| is_preferred_display_jt(container, entry));
     let Some(entry) = entries.next() else {
         return Ok(Vec::new());
     };
