@@ -24,11 +24,13 @@ cadmpeg-core.workspace = true
 cadmpeg-ir.workspace = true
 cadmpeg-container.workspace = true
 cadmpeg-parasolid.workspace = true
+cfb = "0.15"
 flate2.workspace = true
 roxmltree.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 cadmpeg-ir = { workspace = true, features = ["examples"] }

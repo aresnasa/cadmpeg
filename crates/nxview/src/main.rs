@@ -190,6 +190,44 @@ fn main() -> anyhow::Result<()> {
             cam.write_ply(&ply_path)?;
             println!("wrote {}", ply_path.display());
         }
+        "attr" => {
+            let action = args.next().context(
+                "usage: nxview attr get <part.prt> | nxview attr set <in.prt> <out.prt> <title> <value>",
+            )?;
+            match action.as_str() {
+                "get" => {
+                    let path =
+                        PathBuf::from(args.next().context("usage: nxview attr get <part.prt>")?);
+                    for attribute in cadmpeg_codec_nx::read_part_attributes(&path)? {
+                        println!("{}\t{}", attribute.title, attribute.value);
+                    }
+                }
+                "set" => {
+                    let input = PathBuf::from(
+                        args.next()
+                            .context("usage: nxview attr set <in.prt> <out.prt> <title> <value>")?,
+                    );
+                    let output = PathBuf::from(
+                        args.next()
+                            .context("usage: nxview attr set <in.prt> <out.prt> <title> <value>")?,
+                    );
+                    let title = args
+                        .next()
+                        .context("usage: nxview attr set <in.prt> <out.prt> <title> <value>")?;
+                    let value = args
+                        .next()
+                        .context("usage: nxview attr set <in.prt> <out.prt> <title> <value>")?;
+                    let report =
+                        cadmpeg_codec_nx::set_part_attribute(&input, &output, &title, &value)?;
+                    println!("wrote {}", report.output.display());
+                    println!("changed_streams={:?}", report.changed_streams);
+                    println!("source_sha256={}", report.source_sha256);
+                    println!("output_sha256={}", report.output_sha256);
+                    println!("byte_identical={}", report.byte_identical);
+                }
+                other => bail!("unknown attr action: {other}"),
+            }
+        }
         other => {
             // Treat the first argument as a path for convenience.
             let path = PathBuf::from(other);

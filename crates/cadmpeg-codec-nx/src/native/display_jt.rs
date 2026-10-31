@@ -2854,10 +2854,7 @@ fn preferred_display_jt_entry<'a>(
         .filter(|entry| {
             matches!(
                 entry.name.as_str(),
-                "/Root/UG_PART/DisplayJT"
-                    | "UG_PART/DisplayJT"
-                    | "/Root/UG_PART/JT"
-                    | "UG_PART/JT"
+                "/Root/UG_PART/DisplayJT" | "UG_PART/DisplayJT" | "/Root/UG_PART/JT" | "UG_PART/JT"
             )
         })
         .min_by_key(|entry| match entry.name.as_str() {
@@ -2901,7 +2898,9 @@ fn parse_legacy_display_jt_index(
     let Ok(row_count) = usize::try_from(declared_count) else {
         return Ok(None);
     };
-    let Some(table_end) = row_count.checked_mul(8).and_then(|bytes| 12usize.checked_add(bytes))
+    let Some(table_end) = row_count
+        .checked_mul(8)
+        .and_then(|bytes| 12usize.checked_add(bytes))
     else {
         return Ok(None);
     };

@@ -354,11 +354,13 @@ dependencies = [
  "cadmpeg-ir",
  "cadmpeg-parasolid",
  "cadmpeg-test-support",
+ "cfb",
  "flate2",
  "roxmltree",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
 ]
 
 [[package]]

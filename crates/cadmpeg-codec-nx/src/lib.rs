@@ -91,6 +91,7 @@ mod container;
 mod decode;
 mod deltas;
 mod dialect;
+mod edit;
 mod evaluation;
 mod framing;
 mod geometry;
@@ -124,6 +125,11 @@ pub mod fuzz;
 #[doc(hidden)]
 pub use evaluation::{
     saved_body_census_evidence, BodyCensusEvaluation, FeatureBoundary, UnsupportedBodyCensusReason,
+};
+
+pub use edit::{
+    read_part_attributes, set_part_attribute, EditError, EditReport, PartAttribute,
+    PART_ATTRS_STREAM,
 };
 
 use cadmpeg_core::decode::{DecodeContext, View};
