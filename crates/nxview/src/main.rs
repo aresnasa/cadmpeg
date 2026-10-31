@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Cross-platform NX `.prt` probe: decode, tessellate, export OBJ, or view
-//! the result with a small Rust/OpenGL viewer.
+//! the result with a small pure-Rust software viewer.
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -121,7 +121,15 @@ fn main() -> anyhow::Result<()> {
             }
             for path in paths {
                 let mesh = load_mesh(&path, chord(0.01))?;
-                let obj_path = path.with_extension("obj");
+                // Write into the current directory, not next to the (often
+                // read-only) NX installation.
+                let obj_path = PathBuf::from(
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                )
+                .with_extension("obj");
                 write_obj(&obj_path, &mesh)?;
                 println!("wrote {}", obj_path.display());
             }
@@ -294,12 +302,8 @@ fn write_obj(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
 }
 
 fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
-    let (min, max) = view_bounds(&mesh.positions);
-    let target = Vec3::new(
-        (min[0] + max[0]) * 0.5,
-        (min[1] + max[1]) * 0.5,
-        (min[2] + max[2]) * 0.5,
-    );
+    let (min, max, center) = view_bounds(&mesh.positions);
+    let target = Vec3::from(center);
     let extent = (max[0] - min[0])
         .max(max[1] - min[1])
         .max(max[2] - min[2])
@@ -318,7 +322,7 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
 
     let mut yaw = 0.65_f32;
     let mut pitch = 0.35_f32;
-    let mut distance = extent * 2.6;
+    let mut distance = extent * 3.2;
     let mut buffer: Vec<u32> = Vec::new();
     let mut zbuf: Vec<f32> = Vec::new();
     let mut last_mouse: Option<(f32, f32)> = None;
@@ -471,17 +475,19 @@ fn render_software(
 
 /// A 2nd–98th percentile box keeps stray construction faces from shrinking the
 /// whole model to a dot in the viewer. Exact bounds remain the fallback.
-fn view_bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
+fn view_bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3], [f32; 3]) {
     if positions.is_empty() {
-        return ([-1.0; 3], [1.0; 3]);
+        return ([-1.0; 3], [1.0; 3], [0.0; 3]);
     }
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
+    let mut center = [0.0_f32; 3];
     for axis in 0..3 {
         let mut values: Vec<f32> = positions.iter().map(|position| position[axis]).collect();
         values.sort_by(|a, b| a.total_cmp(b));
         let low = values[(values.len() * 2 / 100).min(values.len() - 1)];
         let high = values[(values.len() * 98 / 100).min(values.len() - 1)];
+        center[axis] = values[values.len() / 2];
         if low.is_finite() && high.is_finite() && low < high {
             min[axis] = low;
             max[axis] = high;
@@ -498,6 +504,7 @@ fn view_bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
     (
         [min[0] - margin[0], min[1] - margin[1], min[2] - margin[2]],
         [max[0] + margin[0], max[1] + margin[1], max[2] + margin[2]],
+        center,
     )
 }
 
