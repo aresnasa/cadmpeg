@@ -49,10 +49,7 @@ impl MeshData {
                     .push([normal.x as f32, normal.y as f32, normal.z as f32]);
             }
         } else {
-            let computed = compute_normals(
-                &self.positions[base as usize..],
-                triangles,
-            );
+            let computed = compute_normals(&self.positions[base as usize..], triangles);
             self.normals.extend(computed);
         }
         for triangle in triangles {
@@ -69,8 +66,7 @@ fn compute_normals(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<[f32; 
     let mut normals = vec![[0.0_f32; 3]; positions.len()];
     for triangle in triangles {
         let [a, b, c] = triangle.map(|index| index as usize);
-        let (Some(a), Some(b), Some(c)) =
-            (positions.get(a), positions.get(b), positions.get(c))
+        let (Some(a), Some(b), Some(c)) = (positions.get(a), positions.get(b), positions.get(c))
         else {
             continue;
         };
@@ -251,19 +247,10 @@ fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
                         .triangles
                         .iter()
                         .map(|triangle| {
-                            [
-                                triangle[0] as u32,
-                                triangle[1] as u32,
-                                triangle[2] as u32,
-                            ]
+                            [triangle[0] as u32, triangle[1] as u32, triangle[2] as u32]
                         })
                         .collect();
-                    mesh.add(
-                        &face_mesh.positions,
-                        &face_mesh.normals,
-                        &triangles,
-                        "brep",
-                    );
+                    mesh.add(&face_mesh.positions, &face_mesh.normals, &triangles, "brep");
                 }
                 Err(error) => {
                     mesh.faces_refused += 1;
@@ -352,12 +339,20 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
         }
 
         if let Some((_, scroll)) = window.get_scroll_wheel() {
-            distance = (distance * (1.0 - scroll * 0.12))
-                .clamp(extent * 0.05, extent * 50.0);
+            distance = (distance * (1.0 - scroll * 0.12)).clamp(extent * 0.05, extent * 50.0);
         }
 
         render_software(
-            mesh, width, height, target, yaw, pitch, distance, extent, &mut buffer, &mut zbuf,
+            mesh,
+            width,
+            height,
+            target,
+            yaw,
+            pitch,
+            distance,
+            extent,
+            &mut buffer,
+            &mut zbuf,
         );
         window.update_with_buffer(&buffer, width, height)?;
     }
@@ -507,5 +502,3 @@ fn view_bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3], [f32; 3]) {
         center,
     )
 }
-
-
