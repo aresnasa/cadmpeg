@@ -24,6 +24,8 @@ struct MeshData {
     indices: Vec<u32>,
     cam_points: Vec<[f32; 3]>,
     cam_sections: Vec<usize>,
+    cam_edges: Vec<[u32; 2]>,
+    cam_rapid: Vec<bool>,
     faces_tessellated: usize,
     faces_refused: usize,
 }
@@ -313,16 +315,25 @@ fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
 
     if let Ok(cam) = cam::load(path) {
         if !cam.moves.is_empty() {
-            mesh.cam_points = cam
-                .moves
+            let (samples, edges) = cam.polyline();
+            mesh.cam_points = samples
                 .iter()
-                .map(|mv| [mv.end[0] as f32, mv.end[1] as f32, mv.end[2] as f32])
+                .map(|sample| {
+                    [
+                        sample.point[0] as f32,
+                        sample.point[1] as f32,
+                        sample.point[2] as f32,
+                    ]
+                })
                 .collect();
-            mesh.cam_sections = cam.moves.iter().map(|mv| mv.section).collect();
+            mesh.cam_sections = samples.iter().map(|sample| sample.section).collect();
+            mesh.cam_rapid = samples.iter().map(|sample| sample.rapid).collect();
+            mesh.cam_edges = edges;
             println!(
-                "CAM: sections={} moves={} operations={:?}",
+                "CAM: sections={} moves={} samples={} operations={:?}",
                 cam.path_sections,
                 cam.moves.len(),
+                samples.len(),
                 cam.operations
             );
         }
@@ -426,6 +437,8 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
             mesh,
             &mesh.cam_points,
             &mesh.cam_sections,
+            &mesh.cam_edges,
+            &mesh.cam_rapid,
             width,
             height,
             target,
@@ -446,6 +459,8 @@ fn render_software(
     mesh: &MeshData,
     cam_points: &[[f32; 3]],
     cam_sections: &[usize],
+    cam_edges: &[[u32; 2]],
+    cam_rapid: &[bool],
     width: usize,
     height: usize,
     target: Vec3,
@@ -559,33 +574,108 @@ fn render_software(
         }
     }
 
-    // CAM toolpath move endpoints. A small depth bias keeps them visible on
-    // top of the CAD surface they are cutting.
+    // CAM toolpath moves. A small depth bias keeps them visible on top of the
+    // CAD surface they are cutting. Arc and helical moves have already been
+    // expanded by cam.rs; draw the resulting segments as lines, not just dots.
     const CAM_COLORS: [u32; 8] = [
         0x00ffb347, 0x004fc3f7, 0x0081c784, 0x00ba68c8, 0x00ffd54f, 0x004db6ac, 0x00ff8a65,
         0x009575cd,
     ];
-    for (move_index, point) in cam_points.iter().enumerate() {
-        let section = cam_sections.get(move_index).copied().unwrap_or(0);
-        let color = CAM_COLORS[section % CAM_COLORS.len()];
+    const CAM_RAPID_COLOR: u32 = 0x00ff5252;
+
+    let mut cam_screen = vec![Vec3::ZERO; cam_points.len()];
+    let mut cam_visible = vec![false; cam_points.len()];
+    for (index, point) in cam_points.iter().enumerate() {
         let clip = mvp * Vec4::new(point[0], point[1], point[2], 1.0);
         if clip.w <= 1e-6 {
             continue;
         }
         let inv_w = 1.0 / clip.w;
-        let x = (clip.x * inv_w * 0.5 + 0.5) * width as f32;
-        let y = (1.0 - (clip.y * inv_w * 0.5 + 0.5)) * height as f32;
-        let z = clip.z * inv_w * 0.5 + 0.5;
-        if !(0.0..=1.0).contains(&z) || x < 0.0 || y < 0.0 {
+        cam_screen[index] = Vec3::new(
+            (clip.x * inv_w * 0.5 + 0.5) * width as f32,
+            (1.0 - (clip.y * inv_w * 0.5 + 0.5)) * height as f32,
+            clip.z * inv_w * 0.5 + 0.5,
+        );
+        cam_visible[index] = (0.0..=1.0).contains(&cam_screen[index].z);
+    }
+
+    for edge in cam_edges {
+        let [a, b] = [edge[0] as usize, edge[1] as usize];
+        if a >= cam_visible.len() || b >= cam_visible.len() || !cam_visible[a] || !cam_visible[b] {
             continue;
         }
-        let depth = (z - 0.0008).max(0.0);
-        let xi = x as isize;
-        let yi = y as isize;
+        let section = cam_sections.get(a).copied().unwrap_or(0);
+        let color = if cam_rapid.get(a).copied().unwrap_or(false) {
+            CAM_RAPID_COLOR
+        } else {
+            CAM_COLORS[section % CAM_COLORS.len()]
+        };
+        draw_cam_line(
+            buffer,
+            zbuf,
+            width,
+            height,
+            cam_screen[a],
+            cam_screen[b],
+            color,
+        );
+    }
+
+    for (move_index, screen) in cam_screen.iter().enumerate() {
+        if !cam_visible[move_index] {
+            continue;
+        }
+        let section = cam_sections.get(move_index).copied().unwrap_or(0);
+        let color = if cam_rapid.get(move_index).copied().unwrap_or(false) {
+            CAM_RAPID_COLOR
+        } else {
+            CAM_COLORS[section % CAM_COLORS.len()]
+        };
+        let depth = (screen.z - 0.0008).max(0.0);
+        let xi = screen.x as isize;
+        let yi = screen.y as isize;
         for dy in 0..2 {
             for dx in 0..2 {
                 let px = xi + dx;
                 let py = yi + dy;
+                if px < 0 || py < 0 || px >= width as isize || py >= height as isize {
+                    continue;
+                }
+                let offset = py as usize * width + px as usize;
+                if depth < zbuf[offset] {
+                    zbuf[offset] = depth;
+                    buffer[offset] = color;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_cam_line(
+    buffer: &mut [u32],
+    zbuf: &mut [f32],
+    width: usize,
+    height: usize,
+    a: Vec3,
+    b: Vec3,
+    color: u32,
+) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as usize;
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let x = a.x + dx * t;
+        let y = a.y + dy * t;
+        let z = a.z + (b.z - a.z) * t;
+        let depth = (z - 0.0008).max(0.0);
+        let xi = x as isize;
+        let yi = y as isize;
+        for oy in 0..2 {
+            for ox in 0..2 {
+                let px = xi + ox;
+                let py = yi + oy;
                 if px < 0 || py < 0 || px >= width as isize || py >= height as isize {
                     continue;
                 }
