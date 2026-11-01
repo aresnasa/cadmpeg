@@ -86,20 +86,42 @@ fn kind(ring: &Ring, frame: &Frame) -> Result<Kind, Refusal> {
         return Ok(Kind::Closed);
     }
     for axis in 0..2 {
-        let Some(period) = frame.periods[axis] else {
-            continue;
-        };
-        let turns = (ring.closure[axis] / period).round();
-        if turns != 0.0
-            && zero(ring.closure[axis] - turns * period, period)
-            && zero(ring.closure[1 - axis], extent)
+        let other = 1 - axis;
+        let close_other = zero(ring.closure[other], extent);
+        if let Some(period) = frame.periods[axis] {
+            let turns = (ring.closure[axis] / period).round();
+            if turns != 0.0 && zero(ring.closure[axis] - turns * period, period) && close_other {
+                return Ok(Kind::Wrap { axis });
+            }
+        } else if close_other
+            && ring.closure[axis].abs() >= 0.5 * extent
+            && ring.closure[axis].abs() > CLOSURE_RATIO * extent
         {
+            // The loop traverses one side of a closed carrier whose period was
+            // not inferred from the surface. Use the loop's own span as the
+            // period; the strip builder will close the far side.
             return Ok(Kind::Wrap { axis });
         }
     }
+    let gap = ring.closure[0].abs().max(ring.closure[1].abs());
+    if gap <= extent * 0.05 {
+        return Ok(Kind::Closed);
+    }
+    for axis in 0..2 {
+        let other = 1 - axis;
+        if frame.periods[axis].is_some_and(|period| {
+            let span = ring.closure[axis].abs();
+            span >= 0.5 * extent && span < period && zero(ring.closure[other], extent)
+        }) {
+            // A partial traversal along a periodic axis: the boundary does not
+            // reach the seam, so close the polygon across the gap rather than
+            // dropping the face.
+            return Ok(Kind::Closed);
+        }
+    }
     Err(Refusal::new(format!(
-        "a loop does not close in the parameter plane: it ends ({}, {}) from its start",
-        ring.closure[0], ring.closure[1]
+        "a loop does not close in the parameter plane: it ends ({}, {}) from its start (extent {}, periods {:?})",
+        ring.closure[0], ring.closure[1], extent, frame.periods
     )))
 }
 
@@ -180,11 +202,47 @@ pub(crate) fn regions(rings: Vec<Ring>, frame: &Frame) -> Result<Vec<Region>, Re
                 "loops wrap around both parameters of the surface",
             ));
         }
+        let mut inferred = frame.clone();
+        if inferred.periods[axis].is_none() {
+            if let Some((_, ring)) = wraps.first() {
+                inferred.periods[axis] = Some(ring.closure[axis].abs());
+            }
+        }
         let rings = wraps.into_iter().map(|(_, ring)| ring).collect();
-        outers.extend(strips(rings, axis, frame, &holes)?);
+        outers.extend(strips(rings, axis, &inferred, &holes)?);
     }
     if outers.is_empty() {
-        let Some(domain) = frame.domain else {
+        let domain = frame.domain.or_else(|| {
+            // A face whose boundary never closes into an outer loop still has
+            // a finite set of boundary samples. Use their parameter extent as
+            // a conservative domain; periodic axes use the whole period.
+            let mut low = [f64::INFINITY; 2];
+            let mut high = [f64::NEG_INFINITY; 2];
+            for node in outers.iter().chain(holes.iter()).flatten() {
+                for axis in 0..2 {
+                    low[axis] = low[axis].min(node.uv[axis]);
+                    high[axis] = high[axis].max(node.uv[axis]);
+                }
+            }
+            for axis in 0..2 {
+                if let Some(period) = frame.periods[axis] {
+                    low[axis] = 0.0;
+                    high[axis] = period;
+                } else {
+                    let span = high[axis] - low[axis];
+                    if !span.is_finite() || span <= 0.0 {
+                        return None;
+                    }
+                    let margin = span * 0.01;
+                    low[axis] -= margin;
+                    high[axis] += margin;
+                }
+            }
+            (0..2)
+                .all(|axis| low[axis].is_finite() && high[axis] > low[axis])
+                .then_some([[low[0], high[0]], [low[1], high[1]]])
+        });
+        let Some(domain) = domain else {
             return Err(Refusal::new(
                 "the face has no outer loop and its surface no bounded domain",
             ));
@@ -299,6 +357,17 @@ fn strips(
         entries.push((mean, rising, nodes));
     }
     entries.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let strip_low = entries
+        .iter()
+        .flat_map(|(_, _, nodes)| nodes.iter().map(|node| node.uv[1]))
+        .fold(f64::INFINITY, f64::min);
+    let strip_high = entries
+        .iter()
+        .flat_map(|(_, _, nodes)| nodes.iter().map(|node| node.uv[1]))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let strip_margin = ((strip_high - strip_low).abs() * 0.01).max(1.0e-6);
+    let fallback_low = strip_low - strip_margin;
+    let fallback_high = strip_high + strip_margin;
     let hole_ranges: Vec<[f64; 2]> = holes
         .iter()
         .map(|hole| {
@@ -342,9 +411,7 @@ fn strips(
                         .filter(|(value, _)| *value > mean)
                         .min_by(|a, b| a.0.total_cmp(&b.0))
                         .copied()
-                        .ok_or_else(|| {
-                            Refusal::new("a wrapping loop bounds a strip with no far side")
-                        })?;
+                        .unwrap_or((fallback_high, None));
                     Upper::Bound(bound)
                 }
             };
@@ -358,7 +425,7 @@ fn strips(
                 .filter(|(value, _)| *value < mean)
                 .max_by(|a, b| a.0.total_cmp(&b.0))
                 .copied()
-                .ok_or_else(|| Refusal::new("a wrapping loop bounds a strip with no far side"))?;
+                .unwrap_or((fallback_low, None));
             let turned: Vec<Node> = lower
                 .iter()
                 .map(|node| Node {

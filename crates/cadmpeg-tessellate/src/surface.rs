@@ -278,9 +278,52 @@ impl<'t, 'ir> Carrier<'t, 'ir> {
             (None, None) if self.at_apex(point)? => Ok(self.apex.map(|apex| [0.0, apex])),
             (None, None) => match self.coarse_seed(point)? {
                 Some(seed) => self.project(point, seed),
-                None => Ok(None),
+                None => self.generic_seed(point),
             },
         }
+    }
+
+    /// A bounded numeric seed search for carriers whose domain was not
+    /// recovered from the solved geometry. Procedural surfaces often use a
+    /// near-unit parameter box even when no explicit domain is available.
+    fn generic_seed(&self, point: Point3) -> Result<Option<Uv>, Refusal> {
+        const BOXES: [[f64; 2]; 4] = [
+            [0.0, 1.0],
+            [-1.0, 1.0],
+            [-10.0, 10.0],
+            [0.0, 6.283_185_307_179_586],
+        ];
+        let tolerance = self.size.max(1.0) * 0.05;
+        for bounds in BOXES {
+            let mut best: Option<(f64, Uv)> = None;
+            for i in 0..=6_u8 {
+                for j in 0..=6_u8 {
+                    let fraction = |step: u8| f64::from(step) / 6.0;
+                    let uv = [
+                        bounds[0] + (bounds[1] - bounds[0]) * fraction(i),
+                        bounds[0] + (bounds[1] - bounds[0]) * fraction(j),
+                    ];
+                    if let Some(on) = self.point(uv)? {
+                        let gap = distance(on, point);
+                        if best.is_none_or(|(nearest, _)| gap < nearest) {
+                            best = Some((gap, uv));
+                        }
+                    }
+                }
+            }
+            let Some((_, seed)) = best else {
+                continue;
+            };
+            let Some(projected) = self.project(point, seed)? else {
+                continue;
+            };
+            if let Some(on) = self.point(projected)? {
+                if distance(on, point) <= tolerance {
+                    return Ok(Some(projected));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Whether `point` is the apex of a cone carrier.

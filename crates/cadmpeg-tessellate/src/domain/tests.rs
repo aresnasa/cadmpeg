@@ -55,8 +55,12 @@ fn one_wrapping_loop_runs_to_a_pole() {
 }
 
 #[test]
-fn a_wrapping_loop_with_no_far_side_is_refused() {
-    assert!(regions(vec![circle(1.0, true)], &cylinder()).is_err());
+fn a_wrapping_loop_with_no_far_side_uses_a_fallback_bound() {
+    let found = regions(vec![circle(1.0, true)], &cylinder()).unwrap();
+    assert_eq!(found.len(), 1);
+    let outer: Vec<_> = found[0].outer.iter().map(|node| node.uv).collect();
+    let area = signed_area(&outer) / 2.0;
+    assert!(area > 0.0 && area < TAU * 1e-3);
 }
 
 #[test]

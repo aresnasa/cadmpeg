@@ -197,8 +197,7 @@ fn main() -> anyhow::Result<()> {
             let mut input = File::open(&path)?;
             let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
             let ir = result.ir();
-            let attributes =
-                cadmpeg_codec_nx::read_part_attributes(&path).unwrap_or_default();
+            let attributes = cadmpeg_codec_nx::read_part_attributes(&path).unwrap_or_default();
             let placements = cadmpeg_codec_nx::assembly_placements(ir).unwrap_or_default();
             let losses: Vec<String> = result
                 .report()
@@ -242,10 +241,22 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         "render" => {
-            let path = PathBuf::from(args.next().context("usage: nxview render <part.prt> <out.ppm> [width] [height]")?);
-            let output = PathBuf::from(args.next().context("usage: nxview render <part.prt> <out.ppm> [width] [height]")?);
-            let width = args.next().and_then(|value| value.parse::<usize>().ok()).unwrap_or(1100);
-            let height = args.next().and_then(|value| value.parse::<usize>().ok()).unwrap_or(700);
+            let path = PathBuf::from(
+                args.next()
+                    .context("usage: nxview render <part.prt> <out.ppm> [width] [height]")?,
+            );
+            let output = PathBuf::from(
+                args.next()
+                    .context("usage: nxview render <part.prt> <out.ppm> [width] [height]")?,
+            );
+            let width = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1100);
+            let height = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(700);
             if width == 0 || height == 0 || width > 8192 || height > 8192 {
                 bail!("render dimensions must be between 1 and 8192");
             }
@@ -351,19 +362,8 @@ fn render_image(path: &Path, width: usize, height: usize) -> anyhow::Result<Vec<
     }
     let mut positions = mesh.positions.clone();
     positions.extend(mesh.cam_points.iter().copied());
-    let (min, max, _center) = view_bounds(&positions);
-    let mut mean = [0.0_f64; 3];
-    for position in &positions {
-        for axis in 0..3 {
-            mean[axis] += f64::from(position[axis]);
-        }
-    }
-    let count = positions.len().max(1) as f64;
-    let target = Vec3::new(
-        (mean[0] / count) as f32,
-        (mean[1] / count) as f32,
-        (mean[2] / count) as f32,
-    );
+    let (min, max, center) = view_bounds(&positions);
+    let target = Vec3::new(center[0], center[1], center[2]);
     let extent = (max[0] - min[0])
         .max(max[1] - min[1])
         .max(max[2] - min[2])
@@ -381,7 +381,7 @@ fn render_image(path: &Path, width: usize, height: usize) -> anyhow::Result<Vec<
         target,
         0.65,
         0.35,
-        extent * 4.0,
+        extent * 2.6,
         extent,
         &mut buffer,
         &mut zbuf,
@@ -508,7 +508,12 @@ fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
                 }
                 Err(error) => {
                     mesh.faces_refused += 1;
-                    if mesh.faces_refused <= 10 {
+                    let limit = if std::env::var("NXVIEW_FACE_ERRORS").is_ok() {
+                        usize::MAX
+                    } else {
+                        10
+                    };
+                    if mesh.faces_refused <= limit {
                         println!("  refused face {}: {}", face.id, error);
                     }
                 }

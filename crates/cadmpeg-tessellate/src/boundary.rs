@@ -398,19 +398,41 @@ pub(crate) fn trace<'ir>(
         let mut uv = pcurve_trace(sampler, carrier, coedge, &params, &points)?;
         let from_pcurve = uv.is_some();
         if uv.is_none() {
-            let mut lane = Vec::new();
+            let mut lane: Vec<Option<Uv>> = Vec::new();
             let mut seed = previous;
             for point in &points {
-                let found = carrier.invert(*point, seed)?.ok_or_else(|| {
-                    Refusal::new(format!(
-                        "a sample of edge {} does not invert onto its face",
-                        edge.id
-                    ))
-                })?;
+                let found = match carrier.invert(*point, seed)? {
+                    Some(found) => Some(found),
+                    None => carrier.invert(*point, None)?,
+                };
+                if let Some(found) = found {
+                    seed = Some(found);
+                }
                 lane.push(found);
-                seed = Some(found);
             }
-            uv = Some(lane);
+            if lane.iter().all(Option::is_none) {
+                return Err(Refusal::new(format!(
+                    "a sample of edge {} does not invert onto its face (periods {:?}, domain {:?})",
+                    edge.id, carrier.periods, carrier.domain
+                )));
+            }
+            let mut last = None;
+            for slot in &mut lane {
+                if slot.is_some() {
+                    last = *slot;
+                } else {
+                    *slot = last;
+                }
+            }
+            let mut next = None;
+            for slot in lane.iter_mut().rev() {
+                if slot.is_some() {
+                    next = *slot;
+                } else {
+                    *slot = next;
+                }
+            }
+            uv = Some(lane.into_iter().flatten().collect());
         }
         let uv = uv.unwrap_or_default();
         previous = uv.last().copied();

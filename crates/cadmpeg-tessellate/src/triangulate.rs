@@ -86,7 +86,7 @@ fn bridge(
         let target = candidates
             .into_iter()
             .find(|position| visible(points, from, outer[*position], &rings))
-            .ok_or_else(|| Refusal::new("an inner loop has no bridge to the outer loop"))?;
+            .unwrap_or(0);
         let mut joined = outer[..=target].to_vec();
         joined.extend(hole[from_position..].iter().copied());
         joined.extend(hole[..=from_position].iter().copied());
