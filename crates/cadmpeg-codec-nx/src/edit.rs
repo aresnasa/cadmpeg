@@ -372,21 +372,37 @@ fn repack_splmsstr_growth(
     }
 
     if let Some((_, footer_offset)) = footer {
-        write_u48(
-            &mut output,
-            0x11,
-            footer_offset
-                .checked_add(delta as u64)
-                .ok_or_else(|| EditError::MalformedContainer("footer offset overflow".into()))?,
-        )?;
+        let new_footer_offset = footer_offset
+            .checked_add(delta as u64)
+            .ok_or_else(|| EditError::MalformedContainer("footer offset overflow".into()))?;
+        write_u48(&mut output, 0x11, new_footer_offset)?;
+        if source.len() >= 4 && read_u32(source, source.len() - 4).is_some_and(|value| value != 0) {
+            let footer_start = usize::try_from(new_footer_offset)
+                .map_err(|_| EditError::MalformedContainer("footer offset overflow".into()))?;
+            let checksum_end = output.len() - 4;
+            if footer_start > checksum_end {
+                return Err(EditError::MalformedContainer(
+                    "footer checksum range exceeds file".into(),
+                ));
+            }
+            let checksum = xxh32(&output[footer_start..checksum_end], 0);
+            write_u32(&mut output, checksum_end, checksum)?;
+        }
     }
 
-    // Some SPLMSSTR headers carry an XXH32 checksum of the fixed HEADER/index
-    // block at 0x45a. It is present only when the source field is nonzero and
-    // the directory ends before that field.
-    if read_u32(source, 0x45A).is_some_and(|value| value != 0) && header_end <= 0x45A {
-        let checksum = xxh32(&output[0x19..0x45A], 0);
-        write_u32(&mut output, 0x45A, checksum)?;
+    // The fixed HEADER/index extension places an XXH32 checksum at
+    // `header_end + 0x21e`. It is present only when the source field is
+    // nonzero.
+    let checksum_offset = header_end
+        .checked_add(0x21E)
+        .ok_or_else(|| EditError::MalformedContainer("checksum offset overflow".into()))?;
+    if read_u32(source, checksum_offset).is_some_and(|value| value != 0) {
+        checksum_offset
+            .checked_add(4)
+            .filter(|end| *end <= output.len())
+            .ok_or_else(|| EditError::MalformedContainer("checksum field exceeds file".into()))?;
+        let checksum = xxh32(&output[0x19..checksum_offset], 0);
+        write_u32(&mut output, checksum_offset, checksum)?;
     }
 
     Ok(output)
