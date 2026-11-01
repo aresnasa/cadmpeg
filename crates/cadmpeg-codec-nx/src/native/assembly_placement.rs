@@ -23,12 +23,12 @@ pub(crate) struct AssemblyPlacement {
     pub(super) id: String,
     raw_frame: NativeBytes,
     /// Row-major three-by-four matrix in the serialized translation unit.
-    matrix: [f64; 12],
-    label: String,
-    uuid: CanonicalUuid<String>,
-    source_entry: String,
+    pub(crate) matrix: [f64; 12],
+    pub(crate) label: String,
+    pub(crate) uuid: CanonicalUuid<String>,
+    pub(crate) source_entry: String,
     /// Offset within the container image, including virtual legacy images.
-    pub(super) source_offset: u64,
+    pub(crate) source_offset: u64,
 }
 
 #[derive(Deserialize)]

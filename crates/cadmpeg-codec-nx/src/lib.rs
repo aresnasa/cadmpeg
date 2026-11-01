@@ -132,6 +132,43 @@ pub use edit::{
     PART_ATTRS_STREAM,
 };
 
+/// One decoded NX assembly placement frame.
+#[derive(Debug, Clone)]
+pub struct PlacementInfo {
+    /// Component label carried by the placement frame.
+    pub label: String,
+    /// Persistent occurrence UUID carried by the frame.
+    pub uuid: String,
+    /// Row-major three-by-four placement matrix.
+    pub matrix: [f64; 12],
+    /// Offset of the complete frame within the container image.
+    pub source_offset: u64,
+}
+
+/// Return every decoded assembly placement from an NX document.
+///
+/// Placements are retained as a native NX arena during decode. An absent or
+/// malformed arena is reported explicitly rather than treated as an empty
+/// assembly.
+pub fn assembly_placements(ir: &cadmpeg_ir::CadIr) -> Result<Vec<PlacementInfo>, String> {
+    let namespace = ir
+        .native
+        .namespace("nx")
+        .ok_or_else(|| "document has no nx native namespace".to_string())?;
+    let records = namespace
+        .arena_as::<native::assembly_placement::AssemblyPlacement>("assembly_placements")
+        .map_err(|error| error.to_string())?;
+    Ok(records
+        .into_iter()
+        .map(|record| PlacementInfo {
+            label: record.label,
+            uuid: record.uuid.as_str().to_string(),
+            matrix: record.matrix,
+            source_offset: record.source_offset,
+        })
+        .collect())
+}
+
 use cadmpeg_core::decode::{DecodeContext, View};
 use cadmpeg_core::CodecError;
 use cadmpeg_ir::codec::{CodecBackend, Confidence, Decoded, FormatId};

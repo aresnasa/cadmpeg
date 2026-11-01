@@ -190,6 +190,30 @@ fn main() -> anyhow::Result<()> {
             cam.write_ply(&ply_path)?;
             println!("wrote {}", ply_path.display());
         }
+        "placements" => {
+            let path = PathBuf::from(args.next().context("usage: nxview placements <part.prt>")?);
+            let mut input = File::open(&path)?;
+            let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
+            let placements =
+                cadmpeg_codec_nx::assembly_placements(result.ir()).map_err(anyhow::Error::msg)?;
+            println!("placements={}", placements.len());
+            for placement in placements {
+                println!(
+                    "{} uuid={} offset={:#x}",
+                    placement.label, placement.uuid, placement.source_offset
+                );
+                for row in 0..3 {
+                    let base = row * 4;
+                    println!(
+                        "  [{}, {}, {}, {}]",
+                        placement.matrix[base],
+                        placement.matrix[base + 1],
+                        placement.matrix[base + 2],
+                        placement.matrix[base + 3]
+                    );
+                }
+            }
+        }
         "attr" => {
             let action = args.next().context(
                 "usage: nxview attr get <part.prt> | nxview attr set <in.prt> <out.prt> <title> <value>",
