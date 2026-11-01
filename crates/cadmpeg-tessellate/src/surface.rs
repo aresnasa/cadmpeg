@@ -7,17 +7,23 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 use cadmpeg_core::decode::WorkBudget;
 use cadmpeg_ir::compare::floats_agree;
 use cadmpeg_ir::eval::admission::EvaluationAdmission;
+use cadmpeg_ir::eval::decode::pcurve_uv;
 use cadmpeg_ir::eval::{
-    analytic_surface_parameters_solved, finite_or_refusal, model_surface_partials_by_id,
-    model_surface_point_by_id, nurbs_surface_parameter_near_point, SurfacePartials,
+    analytic_surface_parameters_solved, finite_or_refusal, model_curve_point_by_id,
+    model_surface_partials_by_id, model_surface_point_by_id, nurbs_curve_parameter_domain,
+    nurbs_surface_parameter_near_point, SurfacePartials,
 };
-use cadmpeg_ir::geometry::{ProceduralSurfaceDefinition, SolvedSurfaceGeometry, SurfaceGeometry};
-use cadmpeg_ir::ids::SurfaceId;
+use cadmpeg_ir::geometry::pcurve::PcurveGeometry;
+use cadmpeg_ir::geometry::{
+    BlendCrossSection, BlendRadiusLaw, PlacedCurve, ProceduralCurveDefinition,
+    ProceduralSurfaceDefinition, SolvedCurveGeometry, SolvedSurfaceGeometry, SurfaceGeometry,
+};
+use cadmpeg_ir::ids::{CurveId, SurfaceId};
 use cadmpeg_ir::index::{ModelIndex, StandardIndex};
-use cadmpeg_ir::math::{Point2, Point3};
+use cadmpeg_ir::math::{Point2, Point3, Vector3};
 
 use crate::face::Refusal;
-use crate::plane::{angle, cross, distance, dot, length, sub, Uv};
+use crate::plane::{angle, cross, distance, dot, length, scaled, sub, unit, Uv};
 
 /// Gauss-Newton steps of one point projection.
 const PROJECTION_STEPS: usize = 32;
@@ -32,6 +38,21 @@ const CURVATURE_STEP: f64 = 1e-3;
 /// the parameter is singular at a point.
 const SINGULAR_RATIO: f64 = 1e-9;
 
+/// One contact side of a circular blend: the support surface and the pcurve
+/// that locates its contact point along the spine.
+struct BlendSide<'ir> {
+    support: &'ir SurfaceId,
+    pcurve: &'ir PcurveGeometry,
+}
+
+/// A circular blend rebuilt from the pcurves of its spine intersection.
+struct BlendSection<'ir> {
+    spine: &'ir CurveId,
+    radius: f64,
+    sides: [BlendSide<'ir>; 2],
+    spine_domain: [f64; 2],
+}
+
 /// The evaluation state shared by one face.
 pub(crate) struct Carrier<'t, 'ir> {
     pub(crate) index: &'t ModelIndex<'ir>,
@@ -39,8 +60,10 @@ pub(crate) struct Carrier<'t, 'ir> {
     pub(crate) id: &'ir SurfaceId,
     /// The solved geometry, when the carrier has one.
     solved: Option<&'ir SolvedSurfaceGeometry>,
-    /// A blend whose source stores neither a solved carrier nor a native
-    /// construction, so its section cannot be evaluated.
+    /// A circular blend rebuilt from its contact pcurves.
+    blend: Option<BlendSection<'ir>>,
+    /// A blend whose source stores neither a solved carrier nor a usable
+    /// contact chart, so its boundary must be meshed directly.
     fallback_blend: bool,
     /// The period of each parameter.
     pub(crate) periods: [Option<f64>; 2],
@@ -61,12 +84,195 @@ fn resource(limit: impl std::fmt::Debug) -> Refusal {
     ))
 }
 
+/// Rodrigues rotation of `vector` about unit `axis` by `angle`.
+fn rotate(vector: Vector3, axis: Vector3, angle: f64) -> Vector3 {
+    let (sin, cos) = angle.sin_cos();
+    let axial = dot(axis, vector) * (1.0 - cos);
+    let crossed = cross(axis, vector);
+    Vector3::new(
+        vector.x * cos + crossed.x * sin + axis.x * axial,
+        vector.y * cos + crossed.y * sin + axis.y * axial,
+        vector.z * cos + crossed.z * sin + axis.z * axial,
+    )
+}
+
 /// The solved form of a carrier, looking through placements.
 fn basis(geometry: &SolvedSurfaceGeometry) -> &SolvedSurfaceGeometry {
     match geometry {
         SolvedSurfaceGeometry::Transformed(placed) => basis(placed.basis()),
         other => other,
     }
+}
+
+/// The parameter domain of a solved curve, looking through placements.
+fn curve_domain(index: &ModelIndex<'_>, curve: &CurveId) -> Option<[f64; 2]> {
+    fn solved(geometry: &SolvedCurveGeometry) -> Option<[f64; 2]> {
+        match geometry {
+            SolvedCurveGeometry::Circle(_) | SolvedCurveGeometry::Ellipse(_) => Some([0.0, TAU]),
+            SolvedCurveGeometry::Nurbs(nurbs) => {
+                nurbs_curve_parameter_domain(nurbs).map(|domain| domain.endpoints())
+            }
+            SolvedCurveGeometry::Transformed(placed) => solved(PlacedCurve::basis(placed)),
+            _ => None,
+        }
+    }
+    let curve = index.curves(curve.as_str(), StandardIndex)?;
+    solved(curve.geometry.solved()?)
+}
+
+/// Evaluates one pcurve into its surface parameters.
+fn pcurve_parameters(
+    work: &WorkBudget,
+    pcurve: &PcurveGeometry,
+    parameter: f64,
+) -> Result<Option<Uv>, Refusal> {
+    let Some(uv) = finite_or_refusal(
+        EvaluationAdmission::Standard
+            .within_work_slice(work, |admission| pcurve_uv(admission, pcurve, parameter)),
+    )
+    .map_err(resource)?
+    else {
+        return Ok(None);
+    };
+    let uv = uv.get();
+    Ok(Some([uv.u, uv.v]))
+}
+
+/// Evaluates a solved surface point at one parameter pair.
+fn surface_point_at(
+    index: &ModelIndex<'_>,
+    work: &WorkBudget,
+    surface: &SurfaceId,
+    uv: Uv,
+) -> Result<Option<Point3>, Refusal> {
+    finite_or_refusal(
+        EvaluationAdmission::Standard.within_work_slice(work, |admission| {
+            model_surface_point_by_id(admission, index, surface, uv[0], uv[1])
+        }),
+    )
+    .map(|point| point.map(cadmpeg_ir::features::FinitePoint3::get))
+    .map_err(resource)
+}
+
+/// Whether `offset` is a constant-offset contact chart of `support` whose
+/// offset equals the blend radius.
+fn contact_side_matches<'ir>(
+    index: &ModelIndex<'ir>,
+    work: &WorkBudget,
+    offset: &'ir SurfaceId,
+    pcurve: &'ir PcurveGeometry,
+    support: &'ir SurfaceId,
+    radius: f64,
+    domain: [f64; 2],
+) -> Result<bool, Refusal> {
+    let tolerance = radius * 0.05 + 1.0e-9;
+    for fraction in [0.25, 0.5, 0.75] {
+        let parameter = domain[0] + (domain[1] - domain[0]) * fraction;
+        let Some(uv) = pcurve_parameters(work, pcurve, parameter)? else {
+            return Ok(false);
+        };
+        let Some(offset_point) = surface_point_at(index, work, offset, uv)? else {
+            return Ok(false);
+        };
+        let Some(support_point) = surface_point_at(index, work, support, uv)? else {
+            return Ok(false);
+        };
+        if (distance(offset_point, support_point) - radius).abs() > tolerance {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Rebuilds a circular blend from the pcurves of its spine intersection.
+/// Each context side is an offset support; the pcurve on that side gives the
+/// contact point at a spine parameter.
+fn blend_section<'ir>(
+    index: &ModelIndex<'ir>,
+    work: &WorkBudget,
+    payload: &'ir cadmpeg_ir::geometry::surface_payloads::BlendSurfacePayload,
+) -> Result<Option<BlendSection<'ir>>, Refusal> {
+    let [Some(first), Some(second)] = payload.supports() else {
+        return Ok(None);
+    };
+    if payload.cross_section() != &BlendCrossSection::Circular {
+        return Ok(None);
+    }
+    let &BlendRadiusLaw::Constant { signed_radius } = payload.radius() else {
+        return Ok(None);
+    };
+    let radius = signed_radius.get().abs();
+    if !radius.is_finite() || radius <= 0.0 {
+        return Ok(None);
+    }
+    let Some(spine) = payload.spine().as_ref() else {
+        return Ok(None);
+    };
+    let Some(domain) = curve_domain(index, spine) else {
+        return Ok(None);
+    };
+    let supports = [&first.surface, &second.surface];
+    let Some(procedurals) = index.procedural_curves_for_curve(spine.as_str(), StandardIndex) else {
+        return Ok(None);
+    };
+    for curve in procedurals {
+        let ProceduralCurveDefinition::Intersection { context, .. } = curve.definition() else {
+            continue;
+        };
+        let sides = context.sides();
+        if sides.len() != 2 {
+            continue;
+        }
+        let mut chosen: [Option<BlendSide<'ir>>; 2] = [None, None];
+        let mut matched = true;
+        for side in sides {
+            let (Some(surface), Some(pcurve)) = (side.surface.as_ref(), side.pcurve.as_ref())
+            else {
+                matched = false;
+                break;
+            };
+            let mut support_at = None;
+            for (at, support) in supports.iter().enumerate() {
+                if contact_side_matches(
+                    index,
+                    work,
+                    surface,
+                    &pcurve.geometry,
+                    support,
+                    radius,
+                    domain,
+                )? {
+                    support_at = Some(at);
+                    break;
+                }
+            }
+            let Some(at) = support_at else {
+                matched = false;
+                break;
+            };
+            if chosen[at].is_some() {
+                matched = false;
+                break;
+            }
+            chosen[at] = Some(BlendSide {
+                support: supports[at],
+                pcurve: &pcurve.geometry,
+            });
+        }
+        if !matched {
+            continue;
+        }
+        let [Some(first_side), Some(second_side)] = chosen else {
+            continue;
+        };
+        return Ok(Some(BlendSection {
+            spine,
+            radius,
+            sides: [first_side, second_side],
+            spine_domain: domain,
+        }));
+    }
+    Ok(None)
 }
 
 impl<'t, 'ir> Carrier<'t, 'ir> {
@@ -87,6 +293,7 @@ impl<'t, 'ir> Carrier<'t, 'ir> {
             work,
             id,
             solved,
+            blend: None,
             fallback_blend: false,
             periods: [None, None],
             domain: None,
@@ -167,10 +374,10 @@ impl<'t, 'ir> Carrier<'t, 'ir> {
                     carrier.periods = [Some(TAU), None];
                 }
                 Some(ProceduralSurfaceDefinition::Blend(payload)) => {
-                    // A cacheless blend that also lost its native
-                    // construction has no section this evaluator can
-                    // reconstruct. Its boundary is meshed directly.
-                    if payload.native().is_none() {
+                    if let Some(blend) = blend_section(index, work, payload)? {
+                        carrier.domain = Some([[0.0, 1.0], blend.spine_domain]);
+                        carrier.blend = Some(blend);
+                    } else if payload.native().is_none() {
                         carrier.fallback_blend = true;
                     }
                 }
@@ -226,6 +433,116 @@ impl<'t, 'ir> Carrier<'t, 'ir> {
         self.fallback_blend
     }
 
+    /// Whether the carrier evaluates a reconstructed blend section.
+    pub(crate) fn reconstructed_blend(&self) -> bool {
+        self.blend.is_some()
+    }
+
+    /// The contact direction of one blend side from the spine center.
+    fn blend_contact(
+        &self,
+        side: &BlendSide<'_>,
+        parameter: f64,
+        center: Point3,
+    ) -> Result<Option<Vector3>, Refusal> {
+        let Some(uv) = pcurve_parameters(self.work, side.pcurve, parameter)? else {
+            return Ok(None);
+        };
+        let Some(contact) = surface_point_at(self.index, self.work, side.support, uv)? else {
+            return Ok(None);
+        };
+        Ok(unit(sub(contact, center)))
+    }
+
+    fn blend_spine_point(
+        &self,
+        spine: &CurveId,
+        parameter: f64,
+    ) -> Result<Option<Point3>, Refusal> {
+        finite_or_refusal(
+            EvaluationAdmission::Standard.within_work_slice(self.work, |admission| {
+                model_curve_point_by_id(admission, self.index, spine, parameter)
+            }),
+        )
+        .map(|point| point.map(cadmpeg_ir::features::FinitePoint3::get))
+        .map_err(resource)
+    }
+
+    /// The frame of a rebuilt blend at spine parameter `v`: its center, spine
+    /// tangent, and the two contact directions.
+    fn blend_frame(
+        &self,
+        blend: &BlendSection<'_>,
+        v: f64,
+    ) -> Result<Option<(Point3, Vector3, Vector3, Vector3, f64)>, Refusal> {
+        let Some(center) = self.blend_spine_point(blend.spine, v)? else {
+            return Ok(None);
+        };
+        let Some(first) = self.blend_contact(&blend.sides[0], v, center)? else {
+            return Ok(None);
+        };
+        let Some(second) = self.blend_contact(&blend.sides[1], v, center)? else {
+            return Ok(None);
+        };
+        let span = blend.spine_domain[1] - blend.spine_domain[0];
+        let step = (span * 1.0e-4).max(1.0e-12);
+        let before = self.blend_spine_point(blend.spine, (v - step).max(blend.spine_domain[0]))?;
+        let after = self.blend_spine_point(blend.spine, (v + step).min(blend.spine_domain[1]))?;
+        let Some(tangent) = before
+            .zip(after)
+            .and_then(|(before, after)| unit(sub(after, before)))
+        else {
+            return Ok(None);
+        };
+        let alpha = dot(tangent, cross(first, second)).atan2(dot(first, second));
+        if !alpha.is_finite() || alpha.abs() < 1.0e-9 {
+            return Ok(None);
+        }
+        Ok(Some((center, tangent, first, second, alpha)))
+    }
+
+    fn blend_point_raw(&self, blend: &BlendSection<'_>, uv: Uv) -> Result<Option<Point3>, Refusal> {
+        let Some((center, tangent, first, _, alpha)) = self.blend_frame(blend, uv[1])? else {
+            return Ok(None);
+        };
+        let radial = rotate(first, tangent, uv[0] * alpha);
+        let point = Point3::new(
+            center.x + blend.radius * radial.x,
+            center.y + blend.radius * radial.y,
+            center.z + blend.radius * radial.z,
+        );
+        Ok(point.is_finite().then_some(point))
+    }
+
+    fn blend_partials(
+        &self,
+        blend: &BlendSection<'_>,
+        uv: Uv,
+    ) -> Result<Option<SurfacePartials>, Refusal> {
+        let Some(point) = self.blend_point_raw(blend, uv)? else {
+            return Ok(None);
+        };
+        let domain = self.domain.unwrap_or([[0.0, 1.0], blend.spine_domain]);
+        let u_step = 1.0e-4;
+        let v_step = ((domain[1][1] - domain[1][0]) * 1.0e-5).max(1.0e-12);
+        let at = |u: f64, v: f64| self.blend_point_raw(blend, [u, v]);
+        let u_before = (uv[0] - u_step).max(domain[0][0]);
+        let u_after = (uv[0] + u_step).min(domain[0][1]);
+        let v_before = (uv[1] - v_step).max(domain[1][0]);
+        let v_after = (uv[1] + v_step).min(domain[1][1]);
+        let (Some(pu0), Some(pu1), Some(pv0), Some(pv1)) = (
+            at(u_before, uv[1])?,
+            at(u_after, uv[1])?,
+            at(uv[0], v_before)?,
+            at(uv[0], v_after)?,
+        ) else {
+            return Ok(None);
+        };
+        let du = scaled(sub(pu1, pu0), 1.0 / (u_after - u_before));
+        let dv = scaled(sub(pv1, pv0), 1.0 / (v_after - v_before));
+        Ok(Some(SurfacePartials { point, du, dv }))
+    }
+
     /// Whether the carrier is a plane, which a boundary triangulation
     /// already meets with no interior vertex.
     pub(crate) fn planar(&self) -> bool {
@@ -236,6 +553,9 @@ impl<'t, 'ir> Carrier<'t, 'ir> {
     }
 
     pub(crate) fn point(&self, uv: Uv) -> Result<Option<Point3>, Refusal> {
+        if let Some(blend) = &self.blend {
+            return self.blend_point_raw(blend, uv);
+        }
         finite_or_refusal(
             EvaluationAdmission::Standard.within_work_slice(self.work, |admission| {
                 model_surface_point_by_id(admission, self.index, self.id, uv[0], uv[1])
@@ -246,6 +566,9 @@ impl<'t, 'ir> Carrier<'t, 'ir> {
     }
 
     pub(crate) fn partials(&self, uv: Uv) -> Result<Option<SurfacePartials>, Refusal> {
+        if let Some(blend) = &self.blend {
+            return self.blend_partials(blend, uv);
+        }
         finite_or_refusal(
             EvaluationAdmission::Standard.within_work_slice(self.work, |admission| {
                 model_surface_partials_by_id(admission, self.index, self.id, uv[0], uv[1])

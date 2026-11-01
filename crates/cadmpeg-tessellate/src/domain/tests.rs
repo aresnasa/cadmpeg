@@ -80,6 +80,21 @@ fn a_hole_lies_in_its_outer_loop() {
 }
 
 #[test]
+fn an_inner_loop_just_outside_its_outer_is_kept() {
+    let outer = Ring {
+        nodes: nodes(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]]),
+        closure: [0.0, 0.0],
+    };
+    let hole = Ring {
+        nodes: nodes(&[[5.0, 5.0], [5.0, 6.0], [6.0, 6.0], [6.0, 5.0]]),
+        closure: [0.0, 0.0],
+    };
+    let found = regions(vec![outer, hole], &Frame::default()).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].holes.len(), 1);
+}
+
+#[test]
 fn a_clockwise_ring_around_a_whole_torus_cell_is_the_outer_loop() {
     let corners = [[0.0, 0.0], [-TAU, 0.0], [-TAU, TAU], [0.0, TAU]];
     let ring = Ring {

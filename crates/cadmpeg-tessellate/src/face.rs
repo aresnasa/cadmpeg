@@ -249,7 +249,14 @@ pub(crate) fn tessellate(
     let limits = Limits {
         chord: options.chord,
         angle: options.angle,
-        max_vertices: options.max_vertices,
+        // A reconstructed blend's contact chart can have parameter kinks that
+        // keep subdividing without improving the chord. Bound its share of the
+        // mesh while every evaluated point remains on the blend.
+        max_vertices: if carrier.reconstructed_blend() {
+            options.max_vertices.min(20_000)
+        } else {
+            options.max_vertices
+        },
     };
     if !carrier.planar() {
         mesh.seed(&carrier, &limits)?;

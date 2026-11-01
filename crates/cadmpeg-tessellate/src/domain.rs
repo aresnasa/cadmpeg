@@ -322,7 +322,15 @@ fn assign(
             }
         }
         if !placed {
-            return Err(Refusal::new("an inner loop lies outside every outer loop"));
+            // A reconstructed carrier can place the inner loop just outside
+            // its outer ring through parameter-chart roundoff. Keep the hole
+            // with the largest outer region instead of dropping the face.
+            let Some(region) = regions.iter_mut().max_by(|first, second| {
+                signed_area(&uvs(&first.outer)).total_cmp(&signed_area(&uvs(&second.outer)))
+            }) else {
+                return Err(Refusal::new("an inner loop lies outside every outer loop"));
+            };
+            region.holes.push(hole);
         }
     }
     Ok(regions)
