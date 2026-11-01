@@ -514,7 +514,16 @@ fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
                         10
                     };
                     if mesh.faces_refused <= limit {
-                        println!("  refused face {}: {}", face.id, error);
+                        let surface = ir
+                            .model
+                            .surfaces
+                            .iter()
+                            .find(|surface| surface.id == face.surface)
+                            .map(|surface| &surface.geometry);
+                        println!(
+                            "  refused face {} (surface {:?}): {}",
+                            face.id, surface, error
+                        );
                     }
                 }
             }

@@ -39,6 +39,9 @@ pub(crate) struct Carrier<'t, 'ir> {
     pub(crate) id: &'ir SurfaceId,
     /// The solved geometry, when the carrier has one.
     solved: Option<&'ir SolvedSurfaceGeometry>,
+    /// A blend whose source stores neither a solved carrier nor a native
+    /// construction, so its section cannot be evaluated.
+    fallback_blend: bool,
     /// The period of each parameter.
     pub(crate) periods: [Option<f64>; 2],
     /// The parameter domain of the whole carrier, when it is bounded.
@@ -84,6 +87,7 @@ impl<'t, 'ir> Carrier<'t, 'ir> {
             work,
             id,
             solved,
+            fallback_blend: false,
             periods: [None, None],
             domain: None,
             size: 1.0,
@@ -155,11 +159,22 @@ impl<'t, 'ir> Carrier<'t, 'ir> {
             _ => {}
         }
         if solved.is_none() {
-            if let Some(ProceduralSurfaceDefinition::AxisRevolution(_)) = index
+            match index
                 .procedural_surface_for_surface(id.as_str(), StandardIndex)
                 .map(cadmpeg_ir::geometry::ProceduralSurface::definition)
             {
-                carrier.periods = [Some(TAU), None];
+                Some(ProceduralSurfaceDefinition::AxisRevolution(_)) => {
+                    carrier.periods = [Some(TAU), None];
+                }
+                Some(ProceduralSurfaceDefinition::Blend(payload)) => {
+                    // A cacheless blend that also lost its native
+                    // construction has no section this evaluator can
+                    // reconstruct. Its boundary is meshed directly.
+                    if payload.native().is_none() {
+                        carrier.fallback_blend = true;
+                    }
+                }
+                _ => {}
             }
         }
         if matches!(solved.map(basis), Some(SolvedSurfaceGeometry::Nurbs(_))) {
@@ -203,6 +218,12 @@ impl<'t, 'ir> Carrier<'t, 'ir> {
             }
         }
         Ok(())
+    }
+
+    /// Whether the carrier is a cacheless blend whose native construction is
+    /// also absent, so its boundary is meshed directly.
+    pub(crate) fn fallback_blend(&self) -> bool {
+        self.fallback_blend
     }
 
     /// Whether the carrier is a plane, which a boundary triangulation

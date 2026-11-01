@@ -6,10 +6,10 @@ use std::collections::BTreeSet;
 use cadmpeg_ir::ids::{CoedgeId, FaceId};
 use cadmpeg_ir::index::StandardIndex;
 use cadmpeg_ir::math::{Point3, Vector3};
-use cadmpeg_ir::topology::{LoopBoundary, Sense};
+use cadmpeg_ir::topology::{Face, LoopBoundary, Sense};
 
-use crate::boundary::{trace, Sampler, Traced, TracedLoop};
-use crate::domain::{regions, reversed, Frame, Node, Ring};
+use crate::boundary::{trace, EdgeCache, Sampler, Traced, TracedLoop};
+use crate::domain::{regions, reversed, Frame, Node, Region, Ring};
 use crate::plane::{cross, distance, dot, length, midpoint, scaled, sub, unit, Uv};
 use crate::refine::{Limits, Mesh};
 use crate::surface::Carrier;
@@ -149,6 +149,9 @@ pub(crate) fn tessellate(
         chord: options.chord,
         angle: options.angle,
     };
+    if carrier.fallback_blend() {
+        return boundary_fallback(&sampler, &mut tessellator.edges, &face, &carrier);
+    }
     let mut traced_loops = Vec::new();
     let mut poles: Vec<(Uv, Option<Point3>)> = Vec::new();
     for loop_id in &face.loops {
@@ -280,6 +283,239 @@ pub(crate) fn tessellate(
         }
     }
     Ok(finish(&carrier, mesh, orientation, coedges, deviation))
+}
+
+/// Meshes a face whose carrier has no usable parameterization from its
+/// boundary alone. The loops are projected onto the plane that best follows
+/// the largest loop, triangulated there, and lifted back to the sampled
+/// points. This keeps procedural blends visible when no exact section can be
+/// reconstructed; it does not add interior surface samples.
+fn boundary_fallback<'ir>(
+    sampler: &Sampler<'_, 'ir>,
+    cache: &mut EdgeCache,
+    face: &'ir Face,
+    carrier: &Carrier<'_, 'ir>,
+) -> Result<FaceMesh, Refusal> {
+    let index = sampler.index;
+    let mut loops: Vec<Vec<Point3>> = Vec::new();
+    let mut traces: Vec<(CoedgeTrace, Vec<Point3>)> = Vec::new();
+    for loop_id in &face.loops {
+        let loop_ = index
+            .loops(loop_id.as_str(), StandardIndex)
+            .ok_or_else(|| Refusal::new(format!("the loop {loop_id} is not in the model")))?;
+        let LoopBoundary::Ring(ring) = &loop_.boundary else {
+            continue;
+        };
+        let mut points = Vec::new();
+        for id in ring.coedges() {
+            let coedge = index
+                .coedges(id.as_str(), StandardIndex)
+                .ok_or_else(|| Refusal::new(format!("the coedge {id} is not in the model")))?;
+            let edge = index
+                .edges(coedge.edge.as_str(), StandardIndex)
+                .ok_or_else(|| {
+                    Refusal::new(format!("the edge {} is not in the model", coedge.edge))
+                })?;
+            let samples = sampler.edge(cache, edge)?;
+            let mut lane = samples.points.clone();
+            if coedge.sense == Sense::Reversed {
+                lane.reverse();
+            }
+            for point in &lane {
+                append_unique(&mut points, *point);
+            }
+            traces.push((
+                CoedgeTrace {
+                    coedge: coedge.id.clone(),
+                    uv: Vec::new(),
+                    points: lane.clone(),
+                    from_pcurve: false,
+                },
+                lane,
+            ));
+        }
+        if points.len() > 1
+            && distance(points[0], *points.last().unwrap_or(&points[0]))
+                <= sample_tolerance(&points)
+        {
+            points.pop();
+        }
+        if points.len() >= 3 {
+            loops.push(points);
+        }
+    }
+    if loops.is_empty() {
+        return Err(Refusal::new("the face boundary has no closed loop"));
+    }
+    let normal = loops
+        .iter()
+        .max_by_key(|points| points.len())
+        .and_then(|points| newell(points))
+        .unwrap_or(Vector3::new(0.0, 0.0, 1.0));
+    let origin = loops
+        .iter()
+        .flat_map(|points| points.iter())
+        .fold(Point3::new(0.0, 0.0, 0.0), |sum, point| {
+            Point3::new(sum.x + point.x, sum.y + point.y, sum.z + point.z)
+        });
+    let count = loops.iter().map(Vec::len).sum::<usize>().max(1);
+    let origin = Point3::new(
+        origin.x / count as f64,
+        origin.y / count as f64,
+        origin.z / count as f64,
+    );
+    let first_axis = loops
+        .iter()
+        .find_map(|points| {
+            points.windows(2).find_map(|pair| {
+                let direction = unit(sub(pair[1], pair[0]))?;
+                let along = scaled(normal, dot(direction, normal));
+                unit(Vector3::new(
+                    direction.x - along.x,
+                    direction.y - along.y,
+                    direction.z - along.z,
+                ))
+            })
+        })
+        .unwrap_or_else(|| {
+            let fallback = if normal.x.abs() < 0.9 {
+                Vector3::new(1.0, 0.0, 0.0)
+            } else {
+                Vector3::new(0.0, 1.0, 0.0)
+            };
+            unit(cross(normal, fallback)).unwrap_or(Vector3::new(1.0, 0.0, 0.0))
+        });
+    let second_axis = cross(normal, first_axis);
+    let project = |point: Point3| -> Uv {
+        let offset = sub(point, origin);
+        [dot(offset, first_axis), dot(offset, second_axis)]
+    };
+    let rings: Vec<Ring> = loops
+        .iter()
+        .map(|points| Ring {
+            nodes: points
+                .iter()
+                .map(|point| Node {
+                    uv: project(*point),
+                    point: Some(*point),
+                    open: false,
+                })
+                .collect(),
+            closure: [0.0, 0.0],
+        })
+        .collect();
+    let frame = Frame {
+        periods: [None, None],
+        domain: None,
+        poles: Vec::new(),
+    };
+    let regions = regions(rings, &frame).unwrap_or_else(|_| {
+        loops
+            .iter()
+            .map(|points| Region {
+                outer: points
+                    .iter()
+                    .map(|point| Node {
+                        uv: project(*point),
+                        point: Some(*point),
+                        open: false,
+                    })
+                    .collect(),
+                holes: Vec::new(),
+            })
+            .collect()
+    });
+    let mut mesh = Mesh {
+        uv: Vec::new(),
+        points: Vec::new(),
+        normals: Vec::new(),
+        scales: Vec::new(),
+        triangles: Vec::new(),
+        fixed: BTreeSet::new(),
+    };
+    for region in regions {
+        let mut rings_by_index = Vec::new();
+        for nodes in std::iter::once(&region.outer).chain(&region.holes) {
+            let start = mesh.uv.len();
+            for node in nodes {
+                let Some(point) = node.point else {
+                    continue;
+                };
+                mesh.uv.push(node.uv);
+                mesh.points.push(point);
+                mesh.normals.push(None);
+                mesh.scales.push([1.0, 1.0]);
+            }
+            if mesh.uv.len() > start {
+                rings_by_index.push((start..mesh.uv.len()).collect::<Vec<_>>());
+            }
+        }
+        if rings_by_index.is_empty() {
+            continue;
+        }
+        let outer = rings_by_index.remove(0);
+        if let Ok(triangles) = triangulate(Rings {
+            points: &mesh.uv,
+            outer,
+            holes: rings_by_index,
+        }) {
+            mesh.triangles.extend(triangles.into_iter().map(Some));
+        }
+    }
+    let mut coedges = Vec::new();
+    for (mut trace, points) in traces {
+        trace.uv = points.iter().map(|point| project(*point)).collect();
+        coedges.push(trace);
+    }
+    Ok(finish(carrier, mesh, 1.0, coedges, 0.0))
+}
+
+fn append_unique(points: &mut Vec<Point3>, point: Point3) {
+    let scale = point.x.abs().max(point.y.abs()).max(point.z.abs()).max(1.0);
+    if points
+        .last()
+        .is_none_or(|last| distance(*last, point) > 1.0e-9 * scale)
+    {
+        points.push(point);
+    }
+}
+
+fn sample_tolerance(points: &[Point3]) -> f64 {
+    let low = points.iter().fold(
+        Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
+        |low, point| Point3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z)),
+    );
+    let high = points.iter().fold(
+        Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
+        |high, point| {
+            Point3::new(
+                high.x.max(point.x),
+                high.y.max(point.y),
+                high.z.max(point.z),
+            )
+        },
+    );
+    let diagonal = distance(low, high);
+    diagonal * 1.0e-9
+}
+
+fn newell(points: &[Point3]) -> Option<Vector3> {
+    let origin = points
+        .iter()
+        .fold(Point3::new(0.0, 0.0, 0.0), |sum, point| {
+            Point3::new(sum.x + point.x, sum.y + point.y, sum.z + point.z)
+        });
+    let count = points.len().max(1) as f64;
+    let origin = Point3::new(origin.x / count, origin.y / count, origin.z / count);
+    let mut normal = Vector3::new(0.0, 0.0, 0.0);
+    for (at, point) in points.iter().enumerate() {
+        let next = points[(at + 1) % points.len()];
+        let a = sub(*point, origin);
+        let b = sub(next, origin);
+        let cross = cross(a, b);
+        normal = Vector3::new(normal.x + cross.x, normal.y + cross.y, normal.z + cross.z);
+    }
+    unit(normal)
 }
 
 /// The derived pcurve of a coedge: its trace bisected until each segment
