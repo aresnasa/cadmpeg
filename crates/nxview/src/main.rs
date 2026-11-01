@@ -4,6 +4,7 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -14,6 +15,7 @@ use cadmpeg_tessellate::{Options, Tessellator};
 use glam::camera::rh::{proj::opengl, view};
 use glam::{Vec3, Vec4};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
+use serde_json::json;
 
 mod cam;
 
@@ -190,6 +192,67 @@ fn main() -> anyhow::Result<()> {
             cam.write_ply(&ply_path)?;
             println!("wrote {}", ply_path.display());
         }
+        "json" => {
+            let path = PathBuf::from(args.next().context("usage: nxview json <part.prt>")?);
+            let mut input = File::open(&path)?;
+            let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
+            let ir = result.ir();
+            let attributes =
+                cadmpeg_codec_nx::read_part_attributes(&path).unwrap_or_default();
+            let placements = cadmpeg_codec_nx::assembly_placements(ir).unwrap_or_default();
+            let losses: Vec<String> = result
+                .report()
+                .losses
+                .iter()
+                .map(|loss| format!("{:?}: {}", loss.severity, loss.message))
+                .collect();
+            let value = json!({
+                "path": path.display().to_string(),
+                "container": container_kind(&path),
+                "bodies": ir.model.bodies.len(),
+                "regions": ir.model.regions.len(),
+                "shells": ir.model.shells.len(),
+                "faces": ir.model.faces.len(),
+                "edges": ir.model.edges.len(),
+                "vertices": ir.model.vertices.len(),
+                "surfaces": ir.model.surfaces.len(),
+                "curves": ir.model.curves.len(),
+                "tessellations": ir.model.tessellations.len(),
+                "features": ir.model.features.len(),
+                "attributes_count": ir.model.attributes.len(),
+                "occurrences": ir.model.occurrences.len(),
+                "attributes": attributes
+                    .iter()
+                    .map(|attribute| json!({
+                        "title": attribute.title,
+                        "value": attribute.value,
+                    }))
+                    .collect::<Vec<_>>(),
+                "placements": placements
+                    .iter()
+                    .map(|placement| json!({
+                        "label": placement.label,
+                        "uuid": placement.uuid,
+                        "matrix": placement.matrix,
+                        "source_offset": placement.source_offset,
+                    }))
+                    .collect::<Vec<_>>(),
+                "losses": losses,
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        "render" => {
+            let path = PathBuf::from(args.next().context("usage: nxview render <part.prt> <out.ppm> [width] [height]")?);
+            let output = PathBuf::from(args.next().context("usage: nxview render <part.prt> <out.ppm> [width] [height]")?);
+            let width = args.next().and_then(|value| value.parse::<usize>().ok()).unwrap_or(1100);
+            let height = args.next().and_then(|value| value.parse::<usize>().ok()).unwrap_or(700);
+            if width == 0 || height == 0 || width > 8192 || height > 8192 {
+                bail!("render dimensions must be between 1 and 8192");
+            }
+            let buffer = render_image(&path, width, height)?;
+            write_ppm(&output, &buffer, width, height)?;
+            println!("wrote {} ({}x{})", output.display(), width, height);
+        }
         "placements" => {
             let path = PathBuf::from(args.next().context("usage: nxview placements <part.prt>")?);
             let mut input = File::open(&path)?;
@@ -258,6 +321,84 @@ fn main() -> anyhow::Result<()> {
             info(&path)?;
         }
     }
+    Ok(())
+}
+
+fn container_kind(path: &Path) -> &'static str {
+    let Ok(mut file) = File::open(path) else {
+        return "unknown";
+    };
+    let mut magic = [0_u8; 8];
+    if std::io::Read::read_exact(&mut file, &mut magic).is_err() {
+        return "unknown";
+    }
+    if magic == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
+        "cfb"
+    } else if &magic == b"SPLMSSTR" {
+        "splmsstr"
+    } else {
+        "unknown"
+    }
+}
+
+fn render_image(path: &Path, width: usize, height: usize) -> anyhow::Result<Vec<u32>> {
+    let mesh = load_mesh(path, chord(0.5))?;
+    if mesh.indices.is_empty() && mesh.cam_points.is_empty() {
+        bail!(
+            "{} has no renderable B-rep, JT, or CAM geometry",
+            path.display()
+        );
+    }
+    let mut positions = mesh.positions.clone();
+    positions.extend(mesh.cam_points.iter().copied());
+    let (min, max, _center) = view_bounds(&positions);
+    let mut mean = [0.0_f64; 3];
+    for position in &positions {
+        for axis in 0..3 {
+            mean[axis] += f64::from(position[axis]);
+        }
+    }
+    let count = positions.len().max(1) as f64;
+    let target = Vec3::new(
+        (mean[0] / count) as f32,
+        (mean[1] / count) as f32,
+        (mean[2] / count) as f32,
+    );
+    let extent = (max[0] - min[0])
+        .max(max[1] - min[1])
+        .max(max[2] - min[2])
+        .max(1e-3);
+    let mut buffer = vec![0_u32; width * height];
+    let mut zbuf = vec![f32::INFINITY; width * height];
+    render_software(
+        &mesh,
+        &mesh.cam_points,
+        &mesh.cam_sections,
+        &mesh.cam_edges,
+        &mesh.cam_rapid,
+        width,
+        height,
+        target,
+        0.65,
+        0.35,
+        extent * 4.0,
+        extent,
+        &mut buffer,
+        &mut zbuf,
+    );
+    Ok(buffer)
+}
+
+fn write_ppm(path: &Path, buffer: &[u32], width: usize, height: usize) -> anyhow::Result<()> {
+    let mut file = File::create(path)?;
+    write!(&mut file, "P6\n{width} {height}\n255\n")?;
+    let mut rgb = Vec::with_capacity(buffer.len() * 3);
+    for pixel in buffer {
+        rgb.push(((pixel >> 16) & 0xFF) as u8);
+        rgb.push(((pixel >> 8) & 0xFF) as u8);
+        rgb.push((pixel & 0xFF) as u8);
+    }
+    file.write_all(&rgb)?;
     Ok(())
 }
 

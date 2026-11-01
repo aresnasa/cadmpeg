@@ -15,6 +15,7 @@ cadmpeg-tessellate.workspace = true
 cfb = "0.15"
 glam = "0.34"
 minifb = "0.29"
+serde_json.workspace = true
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
