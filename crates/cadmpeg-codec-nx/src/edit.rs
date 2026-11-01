@@ -338,7 +338,8 @@ impl AttributeTag {
 fn parse_attributes(xml: &[u8]) -> Result<Vec<PartAttribute>, EditError> {
     let text = std::str::from_utf8(xml)
         .map_err(|error| EditError::InvalidAttributeXml(error.to_string()))?;
-    let text = text.trim_end_matches('\0');
+    let text = text
+        .trim_end_matches(|character: char| character == '\0' || character.is_ascii_whitespace());
     if !text.contains("<UgAttributes") {
         return Err(EditError::InvalidAttributeXml(
             "missing UgAttributes root".to_string(),
@@ -358,7 +359,8 @@ fn rewrite_attribute(xml: &[u8], title: &str, value: &str) -> Result<(Vec<u8>, b
     let had_nul = xml.last().copied() == Some(0);
     let text = std::str::from_utf8(xml)
         .map_err(|error| EditError::InvalidAttributeXml(error.to_string()))?;
-    let text = text.trim_end_matches('\0');
+    let text = text
+        .trim_end_matches(|character: char| character == '\0' || character.is_ascii_whitespace());
     if !text.contains("<UgAttributes") {
         return Err(EditError::InvalidAttributeXml(
             "missing UgAttributes root".to_string(),
@@ -694,6 +696,28 @@ mod tests {
     #[test]
     fn escapes_xml_attribute_values() {
         assert_eq!(escape("a&b<c>\"d'"), "a&amp;b&lt;c&gt;&quot;d&apos;");
+    }
+
+    #[test]
+    fn decodes_xml_entities() {
+        assert_eq!(
+            decode_entities("a&amp;b&lt;c&gt;&quot;d&apos;e&#65;&#x42;"),
+            "a&b<c>\"d'eAB"
+        );
+    }
+
+    #[test]
+    fn accepts_trailing_padding_after_the_root() {
+        let xml = b"<UgAttributes><Attribute title=\"A\" value=\"B\"/></UgAttributes>   \0";
+        let (output, changed) = rewrite_attribute(xml, "A", "C").unwrap();
+        assert!(changed);
+        assert_eq!(
+            parse_attributes(&output).unwrap(),
+            vec![PartAttribute {
+                title: "A".to_string(),
+                value: "C".to_string()
+            }]
+        );
     }
 
     #[test]
