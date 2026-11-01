@@ -242,22 +242,19 @@ fn set_splmsstr_attribute(
         });
     }
 
-    if new_xml.len() > length {
-        return Err(EditError::UnsupportedContainer(format!(
-            "SPLMSSTR in-place edit cannot grow part/attrs from {length} to {} bytes; \
-             a container repack is required",
-            new_xml.len()
-        )));
-    }
-
-    let mut output_bytes = source_bytes.to_vec();
-    output_bytes[offset..offset + new_xml.len()].copy_from_slice(&new_xml);
-    let padding = if old_xml.last().copied() == Some(0) {
-        0
+    let output_bytes = if new_xml.len() <= length {
+        let mut output_bytes = source_bytes.to_vec();
+        output_bytes[offset..offset + new_xml.len()].copy_from_slice(&new_xml);
+        let padding = if old_xml.last().copied() == Some(0) {
+            0
+        } else {
+            b' '
+        };
+        output_bytes[offset + new_xml.len()..end].fill(padding);
+        output_bytes
     } else {
-        b' '
+        repack_splmsstr_growth(source_bytes, offset, length, &new_xml)?
     };
-    output_bytes[offset + new_xml.len()..end].fill(padding);
 
     let temp = temporary_path(output);
     if let Err(error) = fs::write(&temp, &output_bytes) {
@@ -298,6 +295,259 @@ fn set_splmsstr_attribute(
         output_sha256: sha256_hex(&written),
         byte_identical: false,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SplmsstrField {
+    offset_position: usize,
+    size_position: usize,
+    offset: u64,
+    size: u64,
+}
+
+/// Grow a file payload and shift only the bytes after it. Directory entries in
+/// both the HEADER and FOOTER regions are updated in place; unrelated payload
+/// bytes and gaps are preserved exactly.
+fn repack_splmsstr_growth(
+    source: &[u8],
+    offset: usize,
+    old_length: usize,
+    new_payload: &[u8],
+) -> Result<Vec<u8>, EditError> {
+    let insertion = offset
+        .checked_add(old_length)
+        .filter(|end| *end <= source.len())
+        .ok_or_else(|| EditError::MalformedContainer("part/attrs span exceeds file".into()))?;
+    let delta = new_payload.len().checked_sub(old_length).ok_or_else(|| {
+        EditError::MalformedContainer("growth repack received a shorter payload".into())
+    })?;
+
+    let footer_offset = read_u48(source, 0x11)
+        .ok_or_else(|| EditError::MalformedContainer("missing SPLMSSTR footer offset".into()))?;
+    let has_footer = footer_offset != 0x0000_ffff_ffff_ffff;
+    let header_count = read_u32(source, 0x1f)
+        .ok_or_else(|| EditError::MalformedContainer("missing HEADER entry count".into()))?;
+    let mut fields = Vec::new();
+    let header_end = parse_splmsstr_fields(source, 0x23, header_count, &mut fields)?;
+
+    let footer = if has_footer {
+        let footer = usize::try_from(footer_offset)
+            .map_err(|_| EditError::MalformedContainer("footer offset overflow".into()))?;
+        if source.get(footer..footer + 6) != Some(b"FOOTER") {
+            return Err(EditError::MalformedContainer(
+                "missing FOOTER marker at footer offset".into(),
+            ));
+        }
+        let count = read_u32(source, footer + 6)
+            .ok_or_else(|| EditError::MalformedContainer("missing FOOTER entry count".into()))?;
+        parse_splmsstr_fields(source, footer + 10, count, &mut fields)?;
+        Some((footer, footer_offset))
+    } else {
+        None
+    };
+
+    let mut output = Vec::with_capacity(source.len() + delta);
+    output.extend_from_slice(&source[..offset]);
+    output.extend_from_slice(new_payload);
+    output.extend_from_slice(&source[insertion..]);
+
+    for field in fields {
+        let shifted = footer.is_some_and(|(footer, _)| field.offset_position >= footer);
+        let write_base = if shifted { delta } else { 0 };
+        let new_offset = if field.offset >= insertion as u64 {
+            field
+                .offset
+                .checked_add(delta as u64)
+                .ok_or_else(|| EditError::MalformedContainer("offset overflow".into()))?
+        } else {
+            field.offset
+        };
+        let new_size = if field.offset == offset as u64 && field.size == old_length as u64 {
+            new_payload.len() as u64
+        } else {
+            field.size
+        };
+        write_u64(&mut output, field.offset_position + write_base, new_offset)?;
+        write_u64(&mut output, field.size_position + write_base, new_size)?;
+    }
+
+    if let Some((_, footer_offset)) = footer {
+        write_u48(
+            &mut output,
+            0x11,
+            footer_offset
+                .checked_add(delta as u64)
+                .ok_or_else(|| EditError::MalformedContainer("footer offset overflow".into()))?,
+        )?;
+    }
+
+    // Some SPLMSSTR headers carry an XXH32 checksum of the fixed HEADER/index
+    // block at 0x45a. It is present only when the source field is nonzero and
+    // the directory ends before that field.
+    if read_u32(source, 0x45A).is_some_and(|value| value != 0) && header_end <= 0x45A {
+        let checksum = xxh32(&output[0x19..0x45A], 0);
+        write_u32(&mut output, 0x45A, checksum)?;
+    }
+
+    Ok(output)
+}
+
+fn parse_splmsstr_fields(
+    bytes: &[u8],
+    mut position: usize,
+    count: u32,
+    fields: &mut Vec<SplmsstrField>,
+) -> Result<usize, EditError> {
+    for _ in 0..count {
+        let name_length = read_u32(bytes, position)
+            .ok_or_else(|| EditError::MalformedContainer("truncated directory entry".into()))?
+            as usize;
+        if !(6..=128).contains(&name_length) {
+            return Err(EditError::MalformedContainer(
+                "directory name length is out of range".into(),
+            ));
+        }
+        position = position
+            .checked_add(4)
+            .and_then(|position| position.checked_add(name_length))
+            .ok_or_else(|| EditError::MalformedContainer("directory entry overflow".into()))?;
+        let offset_position = position;
+        let offset = read_u64(bytes, position)
+            .ok_or_else(|| EditError::MalformedContainer("missing payload offset".into()))?;
+        position += 8;
+        let size_position = position;
+        let size = read_u64(bytes, position)
+            .ok_or_else(|| EditError::MalformedContainer("missing payload size".into()))?;
+        position += 8;
+        if size != 0 {
+            fields.push(SplmsstrField {
+                offset_position,
+                size_position,
+                offset,
+                size,
+            });
+        }
+    }
+    Ok(position)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes(value.try_into().ok()?))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let value = bytes.get(offset..offset.checked_add(8)?)?;
+    Some(u64::from_le_bytes(value.try_into().ok()?))
+}
+
+fn read_u48(bytes: &[u8], offset: usize) -> Option<u64> {
+    let value = bytes.get(offset..offset.checked_add(6)?)?;
+    let mut result = 0_u64;
+    for (index, byte) in value.iter().enumerate() {
+        result |= u64::from(*byte) << (8 * index);
+    }
+    Some(result)
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), EditError> {
+    let target = bytes
+        .get_mut(
+            offset
+                ..offset.checked_add(4).ok_or_else(|| {
+                    EditError::MalformedContainer("checksum field overflow".into())
+                })?,
+        )
+        .ok_or_else(|| EditError::MalformedContainer("checksum field out of bounds".into()))?;
+    target.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn xxh32(data: &[u8], seed: u32) -> u32 {
+    const P1: u32 = 2_654_435_761;
+    const P2: u32 = 2_246_822_519;
+    const P3: u32 = 3_266_489_917;
+    const P4: u32 = 668_265_263;
+    const P5: u32 = 374_761_393;
+
+    let length = data.len();
+    let mut hash;
+    if length >= 16 {
+        let mut values = [
+            seed.wrapping_add(P1).wrapping_add(P2),
+            seed.wrapping_add(P2),
+            seed,
+            seed.wrapping_sub(P1),
+        ];
+        for chunk in data[..length & !15].chunks_exact(16) {
+            for (index, value) in values.iter_mut().enumerate() {
+                let lane = read_u32(chunk, index * 4).unwrap_or(0);
+                *value = value
+                    .wrapping_add(lane.wrapping_mul(P2))
+                    .rotate_left(13)
+                    .wrapping_mul(P1);
+            }
+        }
+        hash = values[0]
+            .rotate_left(1)
+            .wrapping_add(values[1].rotate_left(7))
+            .wrapping_add(values[2].rotate_left(12))
+            .wrapping_add(values[3].rotate_left(18));
+    } else {
+        hash = seed.wrapping_add(P5);
+    }
+    hash = hash.wrapping_add(length as u32);
+
+    let mut index = length & !15;
+    while index + 4 <= length {
+        let lane = read_u32(data, index).unwrap_or(0);
+        hash = hash
+            .wrapping_add(lane.wrapping_mul(P3))
+            .rotate_left(17)
+            .wrapping_mul(P4);
+        index += 4;
+    }
+    while index < length {
+        hash = hash
+            .wrapping_add(u32::from(data[index]).wrapping_mul(P5))
+            .rotate_left(11)
+            .wrapping_mul(P1);
+        index += 1;
+    }
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(P2);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(P3);
+    hash ^= hash >> 16;
+    hash
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), EditError> {
+    let target = bytes
+        .get_mut(
+            offset
+                ..offset.checked_add(8).ok_or_else(|| {
+                    EditError::MalformedContainer("directory field overflow".into())
+                })?,
+        )
+        .ok_or_else(|| EditError::MalformedContainer("directory field out of bounds".into()))?;
+    target.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn write_u48(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), EditError> {
+    let target = bytes
+        .get_mut(
+            offset
+                ..offset
+                    .checked_add(6)
+                    .ok_or_else(|| EditError::MalformedContainer("footer field overflow".into()))?,
+        )
+        .ok_or_else(|| EditError::MalformedContainer("footer field out of bounds".into()))?;
+    for (index, byte) in target.iter_mut().enumerate() {
+        *byte = (value >> (8 * index)) as u8;
+    }
+    Ok(())
 }
 
 fn read_stream(compound: &mut cfb::CompoundFile<File>, name: &str) -> Result<Vec<u8>, EditError> {
@@ -439,14 +689,15 @@ fn rewrite_attribute(xml: &[u8], title: &str, value: &str) -> Result<(Vec<u8>, b
 }
 
 fn new_attribute_attributes(text: &str, title: &str, value: &str) -> Vec<(String, String)> {
-    let uses_utf8 = text.contains("utf8title=") || text.contains("version=\"2\"");
-    let mut attributes = vec![
-        ("owner".to_string(), "part".to_string()),
-        ("title".to_string(), title.to_string()),
-        ("value".to_string(), value.to_string()),
-    ];
+    let uses_utf8 = text.contains("utf8title=") || text.contains("version=\"4\"");
+    let mut attributes = vec![("owner".to_string(), "part".to_string())];
     if uses_utf8 {
-        attributes.push(("version".to_string(), "2".to_string()));
+        attributes.push(("pdmBased".to_string(), "false".to_string()));
+    }
+    attributes.push(("title".to_string(), title.to_string()));
+    attributes.push(("value".to_string(), value.to_string()));
+    if uses_utf8 {
+        attributes.push(("version".to_string(), "3".to_string()));
         attributes.push(("utf8title".to_string(), title.to_string()));
         attributes.push(("utf8value".to_string(), value.to_string()));
     }
@@ -696,6 +947,52 @@ mod tests {
     #[test]
     fn escapes_xml_attribute_values() {
         assert_eq!(escape("a&b<c>\"d'"), "a&amp;b&lt;c&gt;&quot;d&apos;");
+    }
+
+    #[test]
+    fn xxh32_matches_reference_vectors() {
+        assert_eq!(xxh32(b"", 0), 0x02CC_5D05);
+        assert_eq!(xxh32(b"a", 0), 0x550D_7456);
+        assert_eq!(xxh32(b"hello", 0), 0xFB00_77F9);
+    }
+
+    #[test]
+    fn repacks_splmsstr_growth_and_shifts_later_payloads() {
+        let mut data = vec![0_u8; 0x460];
+        data[..8].copy_from_slice(b"SPLMSSTR");
+        data[8] = 0x06;
+        data[0x11..0x17].copy_from_slice(&[0xFF; 6]);
+        data[0x19..0x1F].copy_from_slice(b"HEADER");
+        data[0x1F..0x23].copy_from_slice(&2_u32.to_le_bytes());
+
+        let write_entry =
+            |data: &mut Vec<u8>, position: usize, name: &str, offset: u64, size: u64| {
+                let mut cursor = position;
+                data[cursor..cursor + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
+                cursor += 4;
+                data[cursor..cursor + name.len()].copy_from_slice(name.as_bytes());
+                cursor += name.len();
+                data[cursor..cursor + 8].copy_from_slice(&offset.to_le_bytes());
+                cursor += 8;
+                data[cursor..cursor + 8].copy_from_slice(&size.to_le_bytes());
+                cursor += 8;
+                cursor
+            };
+
+        let after_first = write_entry(&mut data, 0x23, "/Root/part/attrs", 0x460, 10);
+        write_entry(&mut data, after_first, "/Root/other", 0x46A, 5);
+        data.extend_from_slice(b"0123456789");
+        data.extend_from_slice(b"abcde");
+
+        let output = repack_splmsstr_growth(&data, 0x460, 10, b"0123456789ABCDEF").unwrap();
+        assert_eq!(output.len(), data.len() + 6);
+        assert_eq!(&output[0x460..0x470], b"0123456789ABCDEF");
+        assert_eq!(&output[0x470..0x475], b"abcde");
+        let mut fields = Vec::new();
+        parse_splmsstr_fields(&output, 0x23, 2, &mut fields).unwrap();
+        assert!(fields
+            .iter()
+            .any(|field| field.offset == 0x470 && field.size == 5));
     }
 
     #[test]
