@@ -15,15 +15,16 @@ require the NX application, and the file format is decoded from bytes only.
 
 | Input | Result |
 |---|---|
-| Legacy CFB `facetted_hood.prt` | 18 bodies, 93 faces, 266 edges; **48 faces tessellated / 45 refused** |
-| Legacy CFB `glass.prt` | 7 surfaces, 6 curves; topology graph incomplete, no face mesh |
+| Legacy CFB `facetted_hood.prt` | 18 bodies, 93 faces; **72 faces tessellated / 21 refused** |
+| Legacy CFB `glass.prt` | 7 faces; **7 tessellated**, 101,373 triangles |
 | Legacy CFB assembly `ufun_disp_mattex6_test.prt` | external child-part references; legacy JT index decoded, geometry is JT type-31/ULP and not yet meshed |
 | Legacy CFB CAM `hsm_setup.prt` | 8 Path OM sections, **25,124 moves** (7,627 linear / 17,449 circular / 48 helical); operations `RESTMILL_ALL`, `ZLEVEL_POSTS`; CAM points overlay in the viewer |
-| Modern SPLMSSTR `PCB Standoff.prt` | 3 bodies / 32 faces; 29 faces tessellated; opens in the viewer |
+| Modern SPLMSSTR `PCB Standoff.prt` | 3 bodies / 32 faces; 30 faces tessellated; opens in the viewer |
 
-The 45 refusals are concentrated in faces whose loops do not close in the
-surface parameter plane or whose procedural edge has no evaluable parameter.
-These are codec/tessellator gaps, not container gaps. The next two fixes are:
+The remaining refusals are concentrated in faces whose loops do not close in
+the surface parameter plane or whose procedural edge has no evaluable
+parameter. These are codec/tessellator gaps, not container gaps. The next two
+fixes are:
 
 1. Reconcile pcurve parameter ranges with the coedge traversal (seam and
    reversed-pcurve cases) so loops close exactly.
@@ -61,7 +62,9 @@ nxview cam part.prt
 operation-like names, and per-Path-section offsets. `view` overlays the same
 CAM points on the CAD mesh, colored per Path section.
 
-Controls in the viewer: left-drag orbit, wheel zoom, Esc close.
+Controls in the viewer: left-drag orbit, right- or middle-drag pan, wheel
+zoom, `C` toggle the CAM overlay, `R` reset the camera, `F` fit, `S` write a
+PPM screenshot, `P` print the camera state, Esc close.
 
 `NXVIEW_CHORD` controls the tessellation chord tolerance (millimetres). The
 viewer defaults to `0.5`; `obj` defaults to `0.01`. Lower is finer and slower:

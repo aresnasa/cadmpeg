@@ -14,8 +14,10 @@ use cadmpeg_ir::math::{Point3, Vector3};
 use cadmpeg_tessellate::{Options, Tessellator};
 use glam::camera::rh::{proj::opengl, view};
 use glam::{Vec3, Vec4};
-use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 use serde_json::json;
+
+#[cfg(feature = "viewer")]
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 mod cam;
 
@@ -106,7 +108,7 @@ fn compute_normals(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<[f32; 
 }
 
 fn main() -> anyhow::Result<()> {
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "viewer"))]
     unsafe {
         // minifb does not set DPI awareness. Without this, a 1100x700 window
         // is scaled to 2200x1400 physical pixels on a 200% display and the
@@ -146,6 +148,7 @@ fn main() -> anyhow::Result<()> {
                 println!("wrote {}", obj_path.display());
             }
         }
+        #[cfg(feature = "viewer")]
         "view" => {
             let path = args.next().context("usage: nxview view <part.prt>")?;
             let path = PathBuf::from(path);
@@ -157,6 +160,10 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             view(&path, &mesh)?;
+        }
+        #[cfg(not(feature = "viewer"))]
+        "view" => {
+            bail!("viewer not compiled: build with --features viewer")
         }
         "cam" => {
             let path = args.next().context("usage: nxview cam <part.prt>")?;
@@ -376,6 +383,7 @@ fn render_image(path: &Path, width: usize, height: usize) -> anyhow::Result<Vec<
         &mesh.cam_sections,
         &mesh.cam_edges,
         &mesh.cam_rapid,
+        true,
         width,
         height,
         target,
@@ -583,6 +591,52 @@ fn write_obj(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct CameraState {
+    target: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+}
+
+impl CameraState {
+    fn new(target: Vec3, extent: f32) -> Self {
+        Self {
+            target,
+            yaw: 0.65,
+            pitch: 0.35,
+            distance: extent * 4.0,
+        }
+    }
+
+    fn eye(self) -> Vec3 {
+        self.target
+            + Vec3::new(
+                self.distance * self.pitch.cos() * self.yaw.sin(),
+                self.distance * self.pitch.sin(),
+                self.distance * self.pitch.cos() * self.yaw.cos(),
+            )
+    }
+
+    fn orbit(&mut self, dx: f32, dy: f32) {
+        self.yaw -= dx * 0.008;
+        self.pitch = (self.pitch + dy * 0.008).clamp(-1.45, 1.45);
+    }
+
+    fn pan(&mut self, dx: f32, dy: f32, height: usize) {
+        let forward = (self.target - self.eye()).normalize_or_zero();
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        let scale = self.distance * 2.0 * (22.5_f32.to_radians()).tan() / height.max(1) as f32;
+        self.target += right * (-dx * scale) + up * (dy * scale);
+    }
+
+    fn zoom(&mut self, scroll: f32, extent: f32) {
+        self.distance = (self.distance * (1.0 - scroll * 0.12)).clamp(extent * 0.05, extent * 50.0);
+    }
+}
+
+#[cfg(feature = "viewer")]
 fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
     let mut bounds_positions = mesh.positions.clone();
     bounds_positions.extend(mesh.cam_points.iter().copied());
@@ -615,14 +669,17 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
     )?;
     window.set_target_fps(60);
 
-    let mut yaw = 0.65_f32;
-    let mut pitch = 0.35_f32;
-    let mut distance = extent * 4.0;
+    let initial = CameraState::new(target, extent);
+    let mut camera = initial;
     let mut buffer: Vec<u32> = Vec::new();
     let mut zbuf: Vec<f32> = Vec::new();
-    let mut last_mouse: Option<(f32, f32)> = None;
+    let mut last_orbit: Option<(f32, f32)> = None;
+    let mut last_pan: Option<(f32, f32)> = None;
+    let mut show_cam = true;
+    let mut screenshot = 0usize;
 
-    println!("controls: left-drag orbit, wheel zoom, Esc close");
+    println!("controls: left-drag orbit, right/middle-drag pan, wheel zoom");
+    println!("          C CAM on/off, R reset, F fit, S screenshot, P state, Esc close");
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let (width, height) = window.get_size();
@@ -634,20 +691,60 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
             zbuf = vec![f32::INFINITY; width * height];
         }
 
+        if window.is_key_pressed(Key::C, KeyRepeat::No) {
+            show_cam = !show_cam;
+            println!("CAM overlay: {}", if show_cam { "on" } else { "off" });
+        }
+        if window.is_key_pressed(Key::R, KeyRepeat::No) {
+            camera = initial;
+            println!("camera reset");
+        }
+        if window.is_key_pressed(Key::F, KeyRepeat::No) {
+            camera.target = target;
+            camera.distance = extent * 4.0;
+            println!("camera fit");
+        }
+        if window.is_key_pressed(Key::P, KeyRepeat::No) {
+            println!(
+                "camera target=({:.3}, {:.3}, {:.3}) yaw={:.3} pitch={:.3} distance={:.3}",
+                camera.target.x,
+                camera.target.y,
+                camera.target.z,
+                camera.yaw,
+                camera.pitch,
+                camera.distance
+            );
+        }
+        if window.is_key_pressed(Key::S, KeyRepeat::No) {
+            let path = PathBuf::from(format!("nxview-screenshot-{screenshot}.ppm"));
+            write_ppm(&path, &buffer, width, height)?;
+            println!("wrote {}", path.display());
+            screenshot += 1;
+        }
+
         if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Discard) {
             if window.get_mouse_down(MouseButton::Left) {
-                if let Some((lx, ly)) = last_mouse {
-                    yaw -= (mx - lx) * 0.008;
-                    pitch = (pitch + (my - ly) * 0.008).clamp(-1.45, 1.45);
+                if let Some((lx, ly)) = last_orbit {
+                    camera.orbit(mx - lx, my - ly);
                 }
-                last_mouse = Some((mx, my));
+                last_orbit = Some((mx, my));
             } else {
-                last_mouse = None;
+                last_orbit = None;
+            }
+            if window.get_mouse_down(MouseButton::Right)
+                || window.get_mouse_down(MouseButton::Middle)
+            {
+                if let Some((lx, ly)) = last_pan {
+                    camera.pan(mx - lx, my - ly, height);
+                }
+                last_pan = Some((mx, my));
+            } else {
+                last_pan = None;
             }
         }
 
         if let Some((_, scroll)) = window.get_scroll_wheel() {
-            distance = (distance * (1.0 - scroll * 0.12)).clamp(extent * 0.05, extent * 50.0);
+            camera.zoom(scroll, extent);
         }
 
         render_software(
@@ -656,12 +753,13 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
             &mesh.cam_sections,
             &mesh.cam_edges,
             &mesh.cam_rapid,
+            show_cam,
             width,
             height,
-            target,
-            yaw,
-            pitch,
-            distance,
+            camera.target,
+            camera.yaw,
+            camera.pitch,
+            camera.distance,
             extent,
             &mut buffer,
             &mut zbuf,
@@ -678,6 +776,7 @@ fn render_software(
     cam_sections: &[usize],
     cam_edges: &[[u32; 2]],
     cam_rapid: &[bool],
+    show_cam: bool,
     width: usize,
     height: usize,
     target: Vec3,
@@ -800,68 +899,74 @@ fn render_software(
     ];
     const CAM_RAPID_COLOR: u32 = 0x00ff5252;
 
-    let mut cam_screen = vec![Vec3::ZERO; cam_points.len()];
-    let mut cam_visible = vec![false; cam_points.len()];
-    for (index, point) in cam_points.iter().enumerate() {
-        let clip = mvp * Vec4::new(point[0], point[1], point[2], 1.0);
-        if clip.w <= 1e-6 {
-            continue;
+    if show_cam {
+        let mut cam_screen = vec![Vec3::ZERO; cam_points.len()];
+        let mut cam_visible = vec![false; cam_points.len()];
+        for (index, point) in cam_points.iter().enumerate() {
+            let clip = mvp * Vec4::new(point[0], point[1], point[2], 1.0);
+            if clip.w <= 1e-6 {
+                continue;
+            }
+            let inv_w = 1.0 / clip.w;
+            cam_screen[index] = Vec3::new(
+                (clip.x * inv_w * 0.5 + 0.5) * width as f32,
+                (1.0 - (clip.y * inv_w * 0.5 + 0.5)) * height as f32,
+                clip.z * inv_w * 0.5 + 0.5,
+            );
+            cam_visible[index] = (0.0..=1.0).contains(&cam_screen[index].z);
         }
-        let inv_w = 1.0 / clip.w;
-        cam_screen[index] = Vec3::new(
-            (clip.x * inv_w * 0.5 + 0.5) * width as f32,
-            (1.0 - (clip.y * inv_w * 0.5 + 0.5)) * height as f32,
-            clip.z * inv_w * 0.5 + 0.5,
-        );
-        cam_visible[index] = (0.0..=1.0).contains(&cam_screen[index].z);
-    }
 
-    for edge in cam_edges {
-        let [a, b] = [edge[0] as usize, edge[1] as usize];
-        if a >= cam_visible.len() || b >= cam_visible.len() || !cam_visible[a] || !cam_visible[b] {
-            continue;
+        for edge in cam_edges {
+            let [a, b] = [edge[0] as usize, edge[1] as usize];
+            if a >= cam_visible.len()
+                || b >= cam_visible.len()
+                || !cam_visible[a]
+                || !cam_visible[b]
+            {
+                continue;
+            }
+            let section = cam_sections.get(a).copied().unwrap_or(0);
+            let color = if cam_rapid.get(a).copied().unwrap_or(false) {
+                CAM_RAPID_COLOR
+            } else {
+                CAM_COLORS[section % CAM_COLORS.len()]
+            };
+            draw_cam_line(
+                buffer,
+                zbuf,
+                width,
+                height,
+                cam_screen[a],
+                cam_screen[b],
+                color,
+            );
         }
-        let section = cam_sections.get(a).copied().unwrap_or(0);
-        let color = if cam_rapid.get(a).copied().unwrap_or(false) {
-            CAM_RAPID_COLOR
-        } else {
-            CAM_COLORS[section % CAM_COLORS.len()]
-        };
-        draw_cam_line(
-            buffer,
-            zbuf,
-            width,
-            height,
-            cam_screen[a],
-            cam_screen[b],
-            color,
-        );
-    }
 
-    for (move_index, screen) in cam_screen.iter().enumerate() {
-        if !cam_visible[move_index] {
-            continue;
-        }
-        let section = cam_sections.get(move_index).copied().unwrap_or(0);
-        let color = if cam_rapid.get(move_index).copied().unwrap_or(false) {
-            CAM_RAPID_COLOR
-        } else {
-            CAM_COLORS[section % CAM_COLORS.len()]
-        };
-        let depth = (screen.z - 0.0008).max(0.0);
-        let xi = screen.x as isize;
-        let yi = screen.y as isize;
-        for dy in 0..2 {
-            for dx in 0..2 {
-                let px = xi + dx;
-                let py = yi + dy;
-                if px < 0 || py < 0 || px >= width as isize || py >= height as isize {
-                    continue;
-                }
-                let offset = py as usize * width + px as usize;
-                if depth < zbuf[offset] {
-                    zbuf[offset] = depth;
-                    buffer[offset] = color;
+        for (move_index, screen) in cam_screen.iter().enumerate() {
+            if !cam_visible[move_index] {
+                continue;
+            }
+            let section = cam_sections.get(move_index).copied().unwrap_or(0);
+            let color = if cam_rapid.get(move_index).copied().unwrap_or(false) {
+                CAM_RAPID_COLOR
+            } else {
+                CAM_COLORS[section % CAM_COLORS.len()]
+            };
+            let depth = (screen.z - 0.0008).max(0.0);
+            let xi = screen.x as isize;
+            let yi = screen.y as isize;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let px = xi + dx;
+                    let py = yi + dy;
+                    if px < 0 || py < 0 || px >= width as isize || py >= height as isize {
+                        continue;
+                    }
+                    let offset = py as usize * width + px as usize;
+                    if depth < zbuf[offset] {
+                        zbuf[offset] = depth;
+                        buffer[offset] = color;
+                    }
                 }
             }
         }
@@ -939,4 +1044,62 @@ fn view_bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3], [f32; 3]) {
         [max[0] + margin[0], max[1] + margin[1], max[2] + margin[2]],
         center,
     )
+}
+
+#[cfg(test)]
+mod interactive_tests {
+    use super::CameraState;
+    use glam::Vec3;
+
+    fn camera() -> CameraState {
+        CameraState::new(Vec3::new(10.0, 20.0, 30.0), 100.0)
+    }
+
+    #[test]
+    fn eye_is_at_the_configured_distance() {
+        let camera = camera();
+        assert!((camera.eye().distance(camera.target) - camera.distance).abs() < 1e-4);
+    }
+
+    #[test]
+    fn orbit_clamps_pitch_and_changes_yaw() {
+        let mut camera = camera();
+        camera.orbit(100.0, 1000.0);
+        assert!(camera.pitch <= 1.45);
+        assert!((camera.yaw + 0.15).abs() < 1e-4);
+    }
+
+    #[test]
+    fn zoom_stays_inside_fit_limits() {
+        let mut camera = camera();
+        camera.zoom(1000.0, 100.0);
+        assert!((camera.distance - 5.0).abs() < 1e-4);
+        camera.zoom(-1000.0, 100.0);
+        assert!((camera.distance - 605.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn pan_moves_the_target_in_the_view_plane() {
+        let mut camera = camera();
+        let before = camera.target;
+        camera.pan(50.0, -25.0, 700);
+        let moved = camera.target - before;
+        assert!(moved.length() > 0.0);
+        let forward = (camera.target - camera.eye()).normalize_or_zero();
+        assert!(moved.dot(forward).abs() < 1e-3);
+    }
+
+    #[test]
+    fn reset_restores_the_initial_frame() {
+        let initial = camera();
+        let mut camera = initial;
+        camera.orbit(50.0, 25.0);
+        camera.pan(10.0, 10.0, 700);
+        camera.zoom(-5.0, 100.0);
+        camera = initial;
+        assert_eq!(camera.yaw, initial.yaw);
+        assert_eq!(camera.pitch, initial.pitch);
+        assert_eq!(camera.distance, initial.distance);
+        assert_eq!(camera.target, initial.target);
+    }
 }
