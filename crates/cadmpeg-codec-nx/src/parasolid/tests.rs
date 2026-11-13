@@ -173,6 +173,28 @@ fn legacy_short_sections_are_bounded_by_complete_transmit_headers() {
 }
 
 #[test]
+fn legacy_clear_header_keeps_a_following_packed_partition() {
+    let mut bytes =
+        b"**PARASOLID !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~0123456789**************************\n**PART1;\n**END_OF_HEADER*****************************************************************\n"
+            .to_vec();
+    let packed_offset = bytes.len();
+    bytes.extend_from_slice(&zlib_compress(&partition_stream()));
+
+    crate::test_support::with_decode_context_over(
+        &bytes,
+        |_| {},
+        |ctx| {
+            let root = cadmpeg_core::decode::View::over_retained(&bytes);
+            let streams = super::extract_legacy_streams(ctx, root).unwrap();
+
+            assert!(streams.iter().any(|stream| {
+                stream.file_offset == packed_offset && stream.kind() == StreamKind::Partition
+            }));
+        },
+    );
+}
+
+#[test]
 fn parasolid_entity_51_records_retain_layout_selected_references() {
     crate::test_support::with_decode_context(|_ctx| {
         let mut bytes = vec![0, 0x51];

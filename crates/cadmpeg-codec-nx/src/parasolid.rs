@@ -869,7 +869,27 @@ pub(crate) fn extract_legacy_streams<'a>(
         };
         search = next;
     }
-    Ok(streams)
+    let standalone = View::over_retained(part.window());
+    let packed_start = streams.len();
+    append_all_zlib_streams(ctx, standalone, 0, &mut streams, false)?;
+    for stream in &mut streams[packed_start..] {
+        stream.file_offset = stream.file_offset.saturating_add(part.start());
+    }
+    streams.sort_by_key(|stream| stream.file_offset);
+    let mut kept: Vec<Stream> = Vec::with_capacity(streams.len());
+    for stream in streams {
+        let stream_start = u64::try_from(stream.file_offset).unwrap_or(u64::MAX);
+        let stream_end = stream_start.saturating_add(stream.consumed);
+        let contained = kept.iter().any(|outer| {
+            let outer_start = u64::try_from(outer.file_offset).unwrap_or(u64::MAX);
+            let outer_end = outer_start.saturating_add(outer.consumed);
+            outer_start <= stream_start && stream_end <= outer_end
+        });
+        if !contained {
+            kept.push(stream);
+        }
+    }
+    Ok(kept)
 }
 
 fn legacy_stream_start(bytes: &[u8], mut search: usize) -> Option<usize> {

@@ -4,11 +4,11 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::Write as _;
+use std::io::{self, BufRead, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use cadmpeg_codec_nx::NxCodec;
+use cadmpeg_codec_nx::{assembly_placements, read_part_attributes, set_part_attribute, NxCodec};
 use cadmpeg_ir::codec::{Codec, DecodeOptions};
 use cadmpeg_ir::math::{Point3, Vector3};
 use cadmpeg_tessellate::{Options, Tessellator};
@@ -164,6 +164,10 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "viewer"))]
         "view" => {
             bail!("viewer not compiled: build with --features viewer")
+        }
+        "edit" => {
+            let path = PathBuf::from(args.next().context("usage: nxview edit <part.prt>")?);
+            edit_interactive(&path)?;
         }
         "cam" => {
             let path = args.next().context("usage: nxview cam <part.prt>")?;
@@ -408,6 +412,179 @@ fn write_ppm(path: &Path, buffer: &[u32], width: usize, height: usize) -> anyhow
     }
     file.write_all(&rgb)?;
     Ok(())
+}
+
+fn edit_interactive(path: &Path) -> anyhow::Result<()> {
+    let mut pending: Vec<(String, String)> = Vec::new();
+    println!("editing {}", path.display());
+    println!("commands: info, attrs, get <title>, set <title> <value>, edits,");
+    println!("          discard, save [out.prt], render <out.ppm> [w] [h], reload, quit");
+
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+    loop {
+        print!("nx> ");
+        io::stdout().flush()?;
+        let Some(Ok(line)) = lines.next() else {
+            break;
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (command, rest) = line
+            .split_once(char::is_whitespace)
+            .map_or((line, ""), |(command, rest)| (command, rest.trim()));
+        match command {
+            "help" | "?" => {
+                println!("info                  part census");
+                println!("attrs                 list attributes");
+                println!("get <title>           show one attribute");
+                println!("set <title> <value>   stage an attribute edit");
+                println!("edits                 list staged edits");
+                println!("discard               drop staged edits");
+                println!("save [out.prt]        write the staged edits");
+                println!("render <out.ppm> [w] [h]  render the source part");
+                println!("reload                drop staged edits");
+                println!("quit | exit           leave the editor");
+            }
+            "info" => edit_summary(path)?,
+            "attrs" => {
+                for attribute in read_part_attributes(path)? {
+                    println!("{}\t{}", attribute.title, attribute.value);
+                }
+            }
+            "get" => {
+                if rest.is_empty() {
+                    println!("usage: get <title>");
+                    continue;
+                }
+                let attributes = read_part_attributes(path)?;
+                match attributes.iter().find(|attribute| attribute.title == rest) {
+                    Some(attribute) => println!("{}", attribute.value),
+                    None => println!("(missing)"),
+                }
+            }
+            "set" => {
+                let Some((title, value)) = rest.split_once(char::is_whitespace) else {
+                    println!("usage: set <title> <value>");
+                    continue;
+                };
+                let title = title.trim().to_string();
+                let value = value.trim_start().to_string();
+                if title.is_empty() {
+                    println!("attribute title is empty");
+                    continue;
+                }
+                if let Some(existing) = pending.iter_mut().find(|(key, _)| *key == title) {
+                    existing.1 = value;
+                } else {
+                    pending.push((title, value));
+                }
+                println!("staged");
+            }
+            "edits" => {
+                if pending.is_empty() {
+                    println!("(none)");
+                }
+                for (title, value) in &pending {
+                    println!("{title}\t{value}");
+                }
+            }
+            "discard" | "reload" => {
+                pending.clear();
+                println!("staged edits cleared");
+            }
+            "save" => {
+                let output = if rest.is_empty() {
+                    let stem = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("part");
+                    path.with_file_name(format!("{stem}_edited.prt"))
+                } else {
+                    PathBuf::from(rest)
+                };
+                apply_pending(path, &output, &pending)?;
+                println!("wrote {}", output.display());
+                pending.clear();
+            }
+            "render" => {
+                let mut fields = rest.split_whitespace();
+                let Some(output) = fields.next() else {
+                    println!("usage: render <out.ppm> [w] [h]");
+                    continue;
+                };
+                let width = fields
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(800);
+                let height = fields
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(600);
+                let buffer = render_image(path, width, height)?;
+                write_ppm(Path::new(output), &buffer, width, height)?;
+                println!("wrote {output}");
+            }
+            "quit" | "exit" => break,
+            other => println!("unknown command: {other}"),
+        }
+    }
+    Ok(())
+}
+
+fn edit_summary(path: &Path) -> anyhow::Result<()> {
+    let mut input = File::open(path)?;
+    let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
+    let ir = result.ir();
+    let placements = assembly_placements(ir).unwrap_or_default();
+    println!(
+        "bodies={} faces={} edges={} attributes={} occurrences={} placements={}",
+        ir.model.bodies.len(),
+        ir.model.faces.len(),
+        ir.model.edges.len(),
+        ir.model.attributes.len(),
+        ir.model.occurrences.len(),
+        placements.len()
+    );
+    Ok(())
+}
+
+fn apply_pending(input: &Path, output: &Path, edits: &[(String, String)]) -> anyhow::Result<()> {
+    if edits.is_empty() {
+        fs::copy(input, output)?;
+        println!("no staged edits; copied source");
+        return Ok(());
+    }
+    if input == output {
+        bail!("save output must differ from the source path");
+    }
+    let mut current = input.to_path_buf();
+    let mut temporaries = Vec::new();
+    let result = (|| -> anyhow::Result<()> {
+        for (index, (title, value)) in edits.iter().enumerate() {
+            let next = if index + 1 == edits.len() {
+                output.to_path_buf()
+            } else {
+                std::env::temp_dir().join(format!("nxview-edit-{}-{index}.prt", std::process::id()))
+            };
+            let report = set_part_attribute(&current, &next, title, value)?;
+            println!("updated {title:?}: {}", report.changed_streams.join(", "));
+            if index > 0 {
+                let _ = fs::remove_file(&current);
+            }
+            temporaries.push(next.clone());
+            current = next;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for temporary in temporaries {
+            let _ = fs::remove_file(temporary);
+        }
+    }
+    result
 }
 
 fn info(path: &Path) -> anyhow::Result<()> {

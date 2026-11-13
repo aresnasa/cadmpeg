@@ -55,7 +55,15 @@ nxview view part.prt
 
 # Extract NX CAM move endpoints from legacy CFB Path OM sections
 nxview cam part.prt
+
+# Interactive part-attribute editor
+nxview edit part.prt
 ```
+
+`nxview edit` is a small REPL: `info`, `attrs`, `get <title>`,
+`set <title> <value>`, `edits`, `discard`, `save [out.prt]`,
+`render <out.ppm> [w] [h]`, `reload` and `quit`. Staged attributes are
+applied through the byte-preserving `part/attrs` writer only on `save`.
 
 `cam` writes `<name>.cam.ply` (millimetre point cloud) and reports the
 `PATH_3x_linear` / `PATH_3x_circular` / `PATH_3x_helical` move counts,
