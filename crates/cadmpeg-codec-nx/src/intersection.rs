@@ -235,6 +235,9 @@ pub(crate) struct IntersectionCurve {
     pub(crate) support_uv: SupportUv,
     /// Two ext11 UV lanes awaiting assignment to the ordered supports.
     pub(crate) ext_support_uv: SupportUv,
+    /// Set when the construction was admitted by projecting an edge sub-span
+    /// into the chart interior rather than by its serialized terminators.
+    pub(crate) subspan: Option<SubspanFit>,
 }
 
 /// Two distinct non-null support-surface references.
@@ -361,6 +364,27 @@ struct Chart {
     samples: ChartSamples,
     fit_tolerance: FitTolerance,
     ext_support_uv: SupportUv,
+    /// Type-tag offset of the admitted chart record in the inflated stream.
+    pos: usize,
+}
+
+/// An edge sub-span projected onto a chart polyline.
+///
+/// The chart is a solved cache of the full intersection curve. An edge may
+/// name only an interior sub-arc of it, so both B-rep vertices project into the
+/// chart interior instead of onto its endpoints.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SubspanFit {
+    /// Chart parameter at the closest point to the edge start vertex.
+    pub(crate) start_parameter: f64,
+    /// Chart parameter at the closest point to the edge end vertex.
+    pub(crate) end_parameter: f64,
+    /// Distance from the edge start vertex to the chart polyline, in mm.
+    pub(crate) start_distance: f64,
+    /// Distance from the edge end vertex to the chart polyline, in mm.
+    pub(crate) end_distance: f64,
+    /// Type-tag offset of the chart record in the inflated stream.
+    pub(crate) chart_pos: usize,
 }
 
 /// Decode type-38 constructions whose referenced chart and endpoint witnesses
@@ -384,7 +408,7 @@ pub(crate) fn scan_with_graph(
     point_layout: ChartPointLayout,
 ) -> Result<CurveScan, CodecError> {
     let uv = uv_records(stream);
-    let mut constructions = graph.composite_curves();
+    let mut constructions = graph.edge_referenced_composite_curves(stream);
     append_declared_composite_curves(stream, &mut constructions);
     scan_with_auxiliaries(
         AuxiliaryMaps {
@@ -506,46 +530,35 @@ fn enrich(
             .and_then(|target| terms.get(&u32::from(target)))
             .copied(),
     ];
-    if serialized_terms
-        .iter()
-        .zip(chart_endpoints)
-        .any(|(term, endpoint)| {
-            term.is_some_and(|term| Point3::distance(term, endpoint) > chart.fit_tolerance.get())
-        })
-    {
-        return Err(Rejection::EndpointMismatch.into());
-    }
-    if serialized_terms.iter().any(Option::is_none) {
-        let topology_endpoints = graph
-            .unique_curve_edge_witness(construction.xmt)
-            .map(|witness| witness.endpoints)
-            .ok_or_else(|| {
-                if serialized_terms[0].is_none() {
-                    Rejection::MissingStartTerm
-                } else {
-                    Rejection::MissingEndTerm
-                }
-            })?;
-        let matching_permutations = [[0usize, 1usize], [1usize, 0usize]]
-            .into_iter()
-            .filter(|permutation| {
-                permutation.iter().enumerate().all(|(ordinal, topology)| {
-                    Point3::distance(
-                        chart_endpoints[ordinal],
-                        topology_endpoints[*topology].get(),
-                    ) <= chart.fit_tolerance.get()
-                })
-            })
-            .count();
-        if matching_permutations != 1 {
-            return Err((if serialized_terms[0].is_none() {
-                Rejection::MissingStartTerm
-            } else {
-                Rejection::MissingEndTerm
-            })
-            .into());
+    let endpoint_gate = endpoint_gate(
+        construction,
+        chart,
+        chart_endpoints,
+        serialized_terms,
+        graph,
+    );
+    let subspan = match endpoint_gate {
+        Ok(()) => None,
+        Err(rejection) => {
+            // The serialized terminators describe the full solved chart. A
+            // sub-arc edge has interior vertices, so accept it only when the
+            // unique edge that directly names this construction projects both
+            // vertices onto one contiguous run of chart segments per vertex.
+            let fit = chart_subspan(
+                &chart.samples.points(),
+                &chart.samples.parameters(),
+                chart.fit_tolerance.get(),
+                graph
+                    .unique_curve_edge_witness(construction.xmt)
+                    .map(|witness| witness.endpoints.map(FinitePoint3::get)),
+                chart.pos,
+            );
+            match fit {
+                Some(fit) => Some(fit),
+                None => return Err(rejection.into()),
+            }
         }
-    }
+    };
     let (primary_support, secondary_support) =
         construction_supports(construction, uv, bridges, graph).ok_or(Rejection::MissingSupport)?;
     let support_uv = match construction.references[5].and_then(|target| uv.get(&u32::from(target)))
@@ -585,7 +598,176 @@ fn enrich(
         fit_tolerance: chart.fit_tolerance,
         support_uv,
         ext_support_uv,
+        subspan,
     })
+}
+
+/// Validate the serialized terminator witnesses against the chart ends.
+///
+/// A failure here is not fatal on its own: [`enrich`] then tries to project the
+/// unique edge that directly names this construction onto an interior chart
+/// sub-span.
+fn endpoint_gate(
+    construction: CompositeCurve,
+    chart: &Chart,
+    chart_endpoints: [Point3; 2],
+    serialized_terms: [Option<Point3>; 2],
+    graph: &topology::Graph,
+) -> Result<(), Rejection> {
+    if serialized_terms
+        .iter()
+        .zip(chart_endpoints)
+        .any(|(term, endpoint)| {
+            term.is_some_and(|term| Point3::distance(term, endpoint) > chart.fit_tolerance.get())
+        })
+    {
+        return Err(Rejection::EndpointMismatch);
+    }
+    if serialized_terms.iter().any(Option::is_none) {
+        let missing = if serialized_terms[0].is_none() {
+            Rejection::MissingStartTerm
+        } else {
+            Rejection::MissingEndTerm
+        };
+        let topology_endpoints = graph
+            .unique_curve_edge_witness(construction.xmt)
+            .map(|witness| witness.endpoints)
+            .ok_or(missing)?;
+        let matching_permutations = [[0usize, 1usize], [1usize, 0usize]]
+            .into_iter()
+            .filter(|permutation| {
+                permutation.iter().enumerate().all(|(ordinal, topology)| {
+                    Point3::distance(
+                        chart_endpoints[ordinal],
+                        topology_endpoints[*topology].get(),
+                    ) <= chart.fit_tolerance.get()
+                })
+            })
+            .count();
+        if matching_permutations != 1 {
+            return Err(missing);
+        }
+    }
+    Ok(())
+}
+
+/// The closest point on one chart segment to a model point.
+#[derive(Debug, Clone, Copy)]
+struct ChartProjection {
+    distance: f64,
+    parameter: f64,
+    segment: usize,
+}
+
+/// The smallest projected chart parameter that still separates two vertices.
+const SUBSPAN_PARAMETER_TOLERANCE: f64 = 1.0e-9;
+
+/// Project an edge sub-span onto its chart polyline.
+///
+/// Both vertices must project within `tolerance` (millimetres) and each must
+/// have exactly one contiguous run of in-tolerance segments. The projected
+/// parameters must be distinct (either order) and the chart tangent must not
+/// reverse over the span. This helper never chooses a chart: the caller
+/// supplies the single chart selected by the directly named construction's
+/// `references[2]`.
+fn chart_subspan(
+    points: &[Point3],
+    parameters: &[f64],
+    tolerance: f64,
+    endpoints: Option<[Point3; 2]>,
+    chart_pos: usize,
+) -> Option<SubspanFit> {
+    let [start, end] = endpoints?;
+    let start = project_vertex(start, points, parameters, tolerance)?;
+    let end = project_vertex(end, points, parameters, tolerance)?;
+    if (start.parameter - end.parameter).abs() <= SUBSPAN_PARAMETER_TOLERANCE {
+        return None;
+    }
+    if chart_tangent_turn(points, start.segment, end.segment) >= std::f64::consts::PI {
+        return None;
+    }
+    Some(SubspanFit {
+        start_parameter: start.parameter,
+        end_parameter: end.parameter,
+        start_distance: start.distance,
+        end_distance: end.distance,
+        chart_pos,
+    })
+}
+
+/// The closest in-tolerance point on the one contiguous run of chart segments.
+fn project_vertex(
+    point: Point3,
+    points: &[Point3],
+    parameters: &[f64],
+    tolerance: f64,
+) -> Option<ChartProjection> {
+    let mut hits = Vec::new();
+    for index in 0..points.len().saturating_sub(1) {
+        let Some((distance, parameter)) = project_segment(
+            point,
+            points[index],
+            points[index + 1],
+            parameters[index],
+            parameters[index + 1],
+        ) else {
+            continue;
+        };
+        if distance <= tolerance {
+            hits.push(ChartProjection {
+                distance,
+                parameter,
+                segment: index,
+            });
+        }
+    }
+    // Two separated runs mean the chart passes near the vertex twice; the
+    // attachment is ambiguous and must not be guessed.
+    if hits.is_empty()
+        || !hits
+            .windows(2)
+            .all(|pair| pair[1].segment == pair[0].segment + 1)
+    {
+        return None;
+    }
+    hits.into_iter()
+        .min_by(|first, second| first.distance.total_cmp(&second.distance))
+}
+
+/// Project one point onto one chart segment, returning distance and parameter.
+fn project_segment(
+    point: Point3,
+    start: Point3,
+    end: Point3,
+    start_parameter: f64,
+    end_parameter: f64,
+) -> Option<(f64, f64)> {
+    let direction = end.vector_from(start);
+    let length_squared = direction.dot(direction);
+    if length_squared <= 0.0 {
+        return None;
+    }
+    let offset = point.vector_from(start);
+    let fraction = (offset.dot(direction) / length_squared).clamp(0.0, 1.0);
+    let closest = start.translated(direction, fraction);
+    Some((
+        Point3::distance(point, closest),
+        fraction.mul_add(end_parameter - start_parameter, start_parameter),
+    ))
+}
+
+/// Net chart-tangent rotation from one projected segment to the other.
+///
+/// A span that doubles back has antiparallel end tangents and is rejected.
+/// Multi-turn intersections (the nut, cover, and spacer charts here span more
+/// than one revolution) are legitimate: their net end-tangent rotation stays
+/// below π even though their accumulated turning does not.
+fn chart_tangent_turn(points: &[Point3], first_segment: usize, second_segment: usize) -> f64 {
+    let tangent = |segment: usize| points[segment + 1].vector_from(points[segment]).unit();
+    let (Some(first), Some(second)) = (tangent(first_segment), tangent(second_segment)) else {
+        return std::f64::consts::PI;
+    };
+    first.dot(second).clamp(-1.0, 1.0).acos()
 }
 
 fn construction_supports(
@@ -765,6 +947,7 @@ fn chart_records(stream: &[u8], point_layout: ChartPointLayout) -> BTreeMap<u32,
             samples,
             fit_tolerance,
             ext_support_uv,
+            pos: source.pos,
         };
 
         match out.entry(u32::from(source.xmt)) {

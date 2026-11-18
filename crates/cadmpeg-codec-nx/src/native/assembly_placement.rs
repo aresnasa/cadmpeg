@@ -8,9 +8,9 @@ use cadmpeg_core::CodecError;
 use cadmpeg_ir::native::bytes::NativeBytes;
 use serde::{Deserialize, Serialize};
 
-use crate::canonical_uuid::CanonicalUuid;
 use crate::container::{Container, EntryContent};
 use crate::layout::assembly_placement_prefix::MAGIC_VALUE;
+use crate::layout::assembly_placement_prefix_legacy::MAGIC_VALUE as LEGACY_MAGIC_VALUE;
 
 const ENTRY_NAME: &str = "/Root/UG_PART/UG_PART";
 const ID_PREFIX: &str = "nx:assembly:placement#";
@@ -25,7 +25,7 @@ pub(crate) struct AssemblyPlacement {
     /// Row-major three-by-four matrix in the serialized translation unit.
     pub(crate) matrix: [f64; 12],
     pub(crate) label: String,
-    pub(crate) uuid: CanonicalUuid<String>,
+    pub(crate) uuid: String,
     pub(crate) source_entry: String,
     /// Offset within the container image, including virtual legacy images.
     pub(crate) source_offset: u64,
@@ -37,7 +37,7 @@ struct AssemblyPlacementWire {
     raw_frame: NativeBytes,
     matrix: [f64; 12],
     label: String,
-    uuid: CanonicalUuid<String>,
+    uuid: String,
     source_entry: String,
     source_offset: u64,
 }
@@ -55,7 +55,7 @@ impl TryFrom<AssemblyPlacementWire> for AssemblyPlacement {
                 .zip(wire.matrix)
                 .any(|(a, b)| a.to_bits() != b.to_bits())
             || frame.label != wire.label
-            || frame.uuid.as_str() != wire.uuid.as_str()
+            || frame.uuid != wire.uuid
         {
             return Err("assembly placement fields must match the complete raw_frame");
         }
@@ -89,7 +89,7 @@ struct ParsedFrame<'a> {
     length: usize,
     matrix: [f64; 12],
     label: &'a str,
-    uuid: CanonicalUuid<&'a str>,
+    uuid: &'a str,
 }
 
 fn matrix_atom(view: &mut View<'_>) -> Option<f64> {
@@ -145,17 +145,25 @@ fn text_frame<'a>(view: &mut View<'a>) -> Option<&'a str> {
     }
     let length = usize::from(view.u8()?).checked_sub(2)?;
     let bytes = view.take(length)?;
-    if !bytes.is_ascii() || bytes.contains(&0) || view.u8()? != 0 {
+    if !bytes.is_ascii() || bytes.iter().any(u8::is_ascii_control) || view.u8()? != 0 {
         return None;
     }
     std::str::from_utf8(bytes).ok()
 }
 
+fn prefix_len(window: &[u8]) -> Option<usize> {
+    if window.starts_with(&MAGIC_VALUE) {
+        Some(MAGIC_VALUE.len())
+    } else if window.starts_with(&LEGACY_MAGIC_VALUE) {
+        Some(LEGACY_MAGIC_VALUE.len())
+    } else {
+        None
+    }
+}
+
 fn parse_frame(mut view: View<'_>) -> Option<ParsedFrame<'_>> {
     let start = view.position();
-    if view.array::<6>()? != MAGIC_VALUE {
-        return None;
-    }
+    view.skip(prefix_len(view.window())?)?;
     let mut matrix = [0.0; 12];
     for entry in &mut matrix {
         *entry = matrix_atom(&mut view)?;
@@ -167,7 +175,7 @@ fn parse_frame(mut view: View<'_>) -> Option<ParsedFrame<'_>> {
         return None;
     }
     let label = text_frame(&mut view)?;
-    let uuid = CanonicalUuid::new(text_frame(&mut view)?).ok()?;
+    let uuid = text_frame(&mut view)?;
     Some(ParsedFrame {
         length: view.position().checked_sub(start)?,
         matrix,
@@ -209,19 +217,28 @@ pub(in crate::native) fn assembly_placements(
     let Some(payload) = image.child(start, end) else {
         return Ok(Vec::new());
     };
+    let window = payload.window();
+
     let mut records = Vec::new();
-    for (relative, bytes) in payload.window().windows(MAGIC_VALUE.len()).enumerate() {
-        if bytes != MAGIC_VALUE {
+    let mut relative = 0;
+    while relative <= window.len().saturating_sub(LEGACY_MAGIC_VALUE.len()) {
+        let Some(prefix) = prefix_len(&window[relative..]) else {
+            relative += 1;
             continue;
-        }
-        let Some(candidate) = payload.child(start + relative, end) else {
+        };
+        let Some(candidate_start) = start.checked_add(relative) else {
+            break;
+        };
+        let Some(candidate) = payload.child(candidate_start, end) else {
+            relative += prefix;
             continue;
         };
         let Some(frame) = parse_frame(candidate) else {
+            relative += prefix;
             continue;
         };
         let Some(source_offset) = offset.checked_add(u64_from_index(relative)) else {
-            continue;
+            break;
         };
         let raw = candidate
             .window()
@@ -239,11 +256,11 @@ pub(in crate::native) fn assembly_placements(
             raw_frame: (raw).to_vec().into(),
             matrix: frame.matrix,
             label: (frame.label).to_owned(),
-            uuid: CanonicalUuid::new((frame.uuid.as_str()).to_owned())
-                .map_err(|_| CodecError::malformed("NX placement UUID"))?,
+            uuid: frame.uuid.to_owned(),
             source_entry: entry.name.clone(),
             source_offset,
         });
+        relative += frame.length;
     }
     Ok(records)
 }

@@ -57,6 +57,47 @@ deterministic JSON census:
 cargo run -p cadmpeg-codec-nx --bin nx_profile -- FIXTURES OUTPUT.json
 ```
 
+## Byte-preserving edits
+
+Legacy CFB and SPLMSSTR parts expose the `part/attrs` XML writer:
+
+```rust
+use cadmpeg_codec_nx::set_part_attribute;
+
+set_part_attribute(
+    std::path::Path::new("in.prt"),
+    std::path::Path::new("out.prt"),
+    "DB_PART_DESC",
+    "REV B",
+)?;
+```
+
+Assembly relinking replaces only the trailing `ExternalReferences` string
+table and keeps every indexed occurrence record, every other stream, and the
+geometry bytes unchanged:
+
+```rust
+use cadmpeg_codec_nx::{read_assembly_manifest, relink_assembly};
+
+let manifest = read_assembly_manifest(std::path::Path::new("assembly.prt"), None)?;
+println!("{} components", manifest.components.len());
+relink_assembly(
+    std::path::Path::new("assembly.prt"),
+    std::path::Path::new("assembly_relinked.prt"),
+    std::path::Path::new(r"D:\parts"),
+)?;
+```
+
+CFB output rebuilds the compound file and preserves each storage's CLSID,
+creation time, modification time, and state bits. Stream payloads are
+unchanged; a repeated edit of the same input produces the same output.
+SPLMSSTR output repacks the directory, shifts later payloads, and recomputes
+the header and footer XXH32 checksums. A no-op relink copies the source byte
+for byte.
+
+The decoder does not infer an occurrence 4x4 placement when the assembly
+stores only child names and paths.
+
 ## Data model
 
 NX stores part geometry in one or more Parasolid streams inside an SPLMSSTR
@@ -78,12 +119,15 @@ partition images. Assembly files can contain only external child-part
 references and produce no inline geometry.
 
 Complete assembly placement frames transfer to the native `assembly_placements`
-arena with exact bytes, row-major matrices, labels, UUIDs, and source offsets.
-Native validation checks the derived fields against those bytes. Translation
-values retain their serialized unit; child-occurrence binding and unit
-assignment remain unresolved.
+arena with exact bytes, row-major matrices, labels, identity texts, and source
+offsets. NX 10 stores an opaque identity string where NX 12 and later store a
+canonical UUID. Native validation checks the derived fields against those
+bytes. Translation values retain their serialized unit; child-occurrence
+binding and unit assignment remain unresolved.
 
-Embedded JT shape-LOD segments transfer as display tessellation. Validated
+Embedded JT shape-LOD segments transfer as display tessellation. A mesh that
+declares a normal lane absent from the decoded vertex records transfers without
+a normal lane. Validated
 embedded JPEG previews and TIFF material textures transfer as exact document
 assets. Ordered feature-operation records, body dependencies, Boolean
 operations, sketch record lanes, named arrangements and configurations, part

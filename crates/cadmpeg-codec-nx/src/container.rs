@@ -45,6 +45,12 @@ pub(crate) const MAGIC: &[u8; 8] = &splmsstr::MAGIC_VALUE;
 
 const LEGACY_UGII_PREFIX: &[u8; legacy_ugii_payload_prefix::VERSION] = b"\x0d\x01UGII  ";
 
+/// Tagged UGII prefix emitted by older NX writers: the two marker bytes are
+/// reversed and the `UGII  ` literal is NUL-terminated, which moves the
+/// version byte to offset 9.
+const LEGACY_UGII_TAGGED_MARKER: [u8; 2] = [0x01, 0x0d];
+const LEGACY_UGII_TAGGED_MAGIC: &[u8; 6] = b"UGII  ";
+
 /// A directory entry from the `HEADER` or `FOOTER` region.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirEntry {
@@ -785,7 +791,7 @@ fn extref_text_scalar_width(payload: &[u8], at: usize) -> Option<usize> {
 /// the entries that lead from every offset to the payload end. A count is
 /// read at most [`EXTREF_ENTRY_REACH`] bytes after it is written, so only
 /// that window of offsets is kept.
-fn locate_extref_string_table(payload: &[u8]) -> Option<(usize, usize, usize)> {
+pub(crate) fn locate_extref_string_table(payload: &[u8]) -> Option<(usize, usize, usize)> {
     let len = payload.len();
     let window = len.min(EXTREF_ENTRY_REACH) + 1;
     let slot = |offset: usize| offset % window;
@@ -1386,17 +1392,9 @@ pub(crate) fn scan_legacy<'a>(
         .stream("UG_PART/UG_PART")
         .ok_or_else(|| CodecError::WrongFormat("missing legacy UG_PART/UG_PART stream".into()))?;
     let part_view = snapshot.open(ctx, part)?;
-    let payload_prefix = part_view
-        .window()
-        .get(..legacy_ugii_payload_prefix::LEN)
-        .ok_or_else(|| {
-            CodecError::WrongFormat("legacy UG_PART/UG_PART stream has no UGII prefix".into())
-        })?;
-    if payload_prefix[..legacy_ugii_payload_prefix::VERSION] != LEGACY_UGII_PREFIX[..] {
-        return Err(CodecError::WrongFormat(
-            "legacy UG_PART/UG_PART stream is not a UGII payload".into(),
-        ));
-    }
+    let version = legacy_ugii_version(part_view.window()).ok_or_else(|| {
+        CodecError::WrongFormat("legacy UG_PART/UG_PART stream is not a UGII payload".into())
+    })?;
     let part_id = part.id();
     let mut stream_views = Vec::new();
     let mut stream_spans = BTreeMap::new();
@@ -1436,7 +1434,6 @@ pub(crate) fn scan_legacy<'a>(
             body,
         });
     }
-    let version = payload_prefix[legacy_ugii_payload_prefix::VERSION];
     let mut container = Container {
         data: SourceImage::Borrowed(logical_data),
         physical_size: cadmpeg_core::decode::u64_from_index(root.window().len()),
@@ -1448,6 +1445,22 @@ pub(crate) fn scan_legacy<'a>(
     };
     container.fastload_table = container.parse_rmfastload_object_id_table()?;
     Ok((container, part_view))
+}
+
+fn legacy_ugii_version(payload: &[u8]) -> Option<u8> {
+    if let Some(prefix) = payload.get(..legacy_ugii_payload_prefix::LEN) {
+        if prefix[..legacy_ugii_payload_prefix::VERSION] == LEGACY_UGII_PREFIX[..] {
+            return Some(prefix[legacy_ugii_payload_prefix::VERSION]);
+        }
+    }
+    let head = payload.get(..legacy_ugii_payload_prefix::LEN + 1)?;
+    if head[..2] == LEGACY_UGII_TAGGED_MARKER[..]
+        && &head[2..8] == LEGACY_UGII_TAGGED_MAGIC
+        && head[8] == 0
+    {
+        return Some(head[9]);
+    }
+    None
 }
 
 fn directory_region(
@@ -1521,7 +1534,16 @@ fn try_entry(
     let Some(raw) = data.get(name_start..name_end) else {
         return Ok(None);
     };
-    if !raw.starts_with(b"/Root") || !raw.iter().all(|&b| (0x20..0x7f).contains(&b)) {
+    // NX embeds CFB sub-storage names in the FOOTER directory. Their last
+    // component carries the OLE marker byte (0x01 for a storage, 0x05 for a
+    // stream) directly before the component name, so a strict printable check
+    // would reject otherwise valid directories. Keep NUL and DEL out: names
+    // are not terminated here and must not borrow payload bytes.
+    if !raw.starts_with(b"/Root")
+        || !raw
+            .iter()
+            .all(|&b| b.is_ascii_graphic() || b == b' ' || (0x01..0x20).contains(&b))
+    {
         return Ok(None);
     }
     let payload = name_end;

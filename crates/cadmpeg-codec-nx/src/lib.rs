@@ -69,9 +69,11 @@
 //! operation suppression remains unresolved. Embedded
 //! JT coordinates and triangle connectivity transfer as canonical tessellations.
 //! Native assembly placement frames retain exact bytes and decoded matrices.
-//! Complete design history, binding placements to external child occurrences,
-//! material and appearance assignment and `.prt` writing are not supported.
-//! Part attributes transfer as document attributes. The object-model extraction
+//! Complete design history and material/appearance assignment are not
+//! supported. Part attributes transfer as document attributes. Byte-preserving
+//! writers replace the `part/attrs` payload and the trailing
+//! `ExternalReferences` string table without re-encoding geometry. The
+//! object-model extraction
 //! and attachment tier (record families, feature semantics, and IR writing) is
 //! crate-internal and reached only through the decode entry point.
 
@@ -86,6 +88,7 @@ macro_rules! propagate_resource {
     };
 }
 
+mod assembly;
 mod canonical_uuid;
 mod container;
 mod decode;
@@ -127,9 +130,13 @@ pub use evaluation::{
     saved_body_census_evidence, BodyCensusEvaluation, FeatureBoundary, UnsupportedBodyCensusReason,
 };
 
+pub use assembly::{
+    read_assembly_manifest, read_external_reference_table, relink_assembly, AssemblyComponent,
+    AssemblyManifest, ExternalReferenceTable, RelinkReport,
+};
 pub use edit::{
-    read_part_attributes, set_part_attribute, EditError, EditReport, PartAttribute,
-    PART_ATTRS_STREAM,
+    read_part_attributes, replace_cfb_stream, set_part_attribute, EditError, EditReport,
+    PartAttribute, PART_ATTRS_STREAM,
 };
 
 /// One decoded NX assembly placement frame.

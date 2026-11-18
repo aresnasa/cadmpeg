@@ -5,6 +5,7 @@ Cargo.lock.orig
 
 # cadmpeg scratch decode outputs at repo root
 /*.cadir.json
+/*.log
 /.scratch*
 /.repro/
 

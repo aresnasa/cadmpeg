@@ -27,6 +27,15 @@ fn jt_int32_cdp2_decodes_counted_vector() {
 }
 
 #[test]
+fn jt_int32_cdp2_admits_empty_packet_at_oob_depth() {
+    let empty = [0, 0, 0, 0];
+    assert_eq!(frame_int32_cdp2(&empty, 4), Some((0, 0, 4)));
+    assert_eq!(decode_int32_cdp2(&empty, 4), Some((Vec::new(), 4)));
+    assert_eq!(frame_int32_cdp2(&empty, 5), None);
+    assert_eq!(decode_int32_cdp2(&empty, 5), None);
+}
+
+#[test]
 fn jt_int32_cdp2_refuses_nesting_at_caller_limit() {
     let packet = [2, 0, 0, 0, 1, 21, 0, 0, 0, 0x00, 0xc0, 0x16, 0x04];
 

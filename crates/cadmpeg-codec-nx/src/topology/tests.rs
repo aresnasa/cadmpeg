@@ -27,7 +27,7 @@ use crate::NxCodec;
 use cadmpeg_core::decode::View;
 
 #[test]
-fn unique_candidate_filter_reuses_input_storage() {
+fn unique_candidate_filter_keeps_unambiguous_identities() {
     let candidates = [9, 7, 2, 7, 4, 7]
         .into_iter()
         .enumerate()
@@ -39,11 +39,7 @@ fn unique_candidate_filter_reuses_input_storage() {
             shift: index % 2,
         })
         .collect::<Vec<_>>();
-    let storage = candidates.as_ptr();
-    let capacity = candidates.capacity();
-    let selected = Graph::select_unique_candidates(candidates);
-    assert_eq!(selected.as_ptr(), storage);
-    assert_eq!(selected.capacity(), capacity);
+    let (selected, ambiguous) = Graph::select_unique_candidates(candidates);
     assert_eq!(
         selected
             .iter()
@@ -51,6 +47,8 @@ fn unique_candidate_filter_reuses_input_storage() {
             .collect::<Vec<_>>(),
         [(2, 80, 120, 0), (4, 160, 200, 0), (9, 0, 40, 0)]
     );
+    assert_eq!(ambiguous.len(), 3);
+    assert!(ambiguous.iter().all(|node| node.xmt() == 7));
 }
 
 #[test]
@@ -68,8 +66,9 @@ fn unique_candidate_identity_includes_the_record_kind() {
         end: 80,
         ..point
     };
-    let selected = Graph::select_unique_candidates(vec![point, line]);
+    let (selected, ambiguous) = Graph::select_unique_candidates(vec![point, line]);
     assert_eq!(selected.len(), 2);
+    assert!(ambiguous.is_empty());
     assert!(selected
         .iter()
         .any(|node| node.kind == point.kind && node.pos == point.pos));
@@ -264,6 +263,23 @@ fn topology_admits_high_identity_region_from_shell_ownership() {
         Some(u32::MAX)
     );
     assert!(graph.has_complete_body_topology());
+}
+
+#[test]
+fn topology_prefers_escaped_record_when_direct_xmt_is_implausible() {
+    let mut edge = record(16, 33);
+    edge[2] = 0xff;
+    put_ref(&mut edge, 3, 9);
+    put_ref(&mut edge, 9, 1);
+    put_f64(&mut edge, 11, 0.0);
+    for index in 0..7 {
+        put_ref(&mut edge, 19 + index * 2, 1);
+    }
+    let mut stream = edge;
+    stream.extend_from_slice(&[0xaa; 6]);
+
+    let graph = Graph::parse(&stream);
+    assert_eq!(graph.at_pos(0).map(Node::xmt), Some(9));
 }
 
 #[test]
@@ -681,7 +697,9 @@ fn topology_rejects_overlapping_candidates_without_ranking() {
         end: 32,
     };
 
-    assert!(Graph::select_non_overlapping_candidates(&[], vec![first, second]).is_empty());
+    let (selected, ambiguous) = Graph::select_non_overlapping_candidates(&[], vec![first, second]);
+    assert!(selected.is_empty());
+    assert_eq!(ambiguous.len(), 2);
 }
 
 #[test]
@@ -711,7 +729,7 @@ fn topology_admits_disjoint_bounded_records_in_one_overlap_cluster() {
         end: 70,
     };
 
-    let selected =
+    let (selected, _) =
         Graph::select_non_overlapping_candidates(&stream, vec![face(4, 0), spanning, face(5, 59)]);
     assert_eq!(
         selected.iter().map(|node| node.xmt()).collect::<Vec<_>>(),
@@ -739,7 +757,7 @@ fn topology_bounds_a_record_at_the_type_38_schema_header() {
         end: 39,
     };
 
-    let selected = Graph::select_non_overlapping_candidates(&stream, vec![plane, embedded]);
+    let (selected, _) = Graph::select_non_overlapping_candidates(&stream, vec![plane, embedded]);
     assert_eq!(
         selected.iter().map(|node| node.xmt()).collect::<Vec<_>>(),
         [6]
@@ -809,11 +827,13 @@ fn topology_resolves_overlap_before_duplicate_identity() {
         end: 32,
     };
 
-    assert!(Graph::select_unique_candidates(vec![outer, embedded]).is_empty());
-    let selected = Graph::select_unique_candidates(Graph::select_non_overlapping_candidates(
-        &stream,
-        vec![outer, embedded],
-    ));
+    let (unique, duplicates) = Graph::select_unique_candidates(vec![outer, embedded]);
+    assert!(unique.is_empty());
+    assert_eq!(duplicates.len(), 2);
+    let (non_overlapping, ambiguous) =
+        Graph::select_non_overlapping_candidates(&stream, vec![outer, embedded]);
+    assert_eq!(ambiguous.len(), 1);
+    let (selected, _) = Graph::select_unique_candidates(non_overlapping);
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].pos, outer.pos);
     assert_eq!(selected[0].end(), outer.end());
@@ -1222,4 +1242,27 @@ fn edge_endpoint_witness_uses_partner_and_only_null_falls_back() {
             }
         });
     }
+}
+
+#[test]
+fn swept_surface_record_exposes_profile_and_direction() {
+    let mut stream = record(67, 53);
+    put_ref(&mut stream, 2, 6);
+    for index in 0..5 {
+        put_ref(&mut stream, 8 + index * 2, 1);
+    }
+    stream[18] = b'+';
+    put_ref(&mut stream, 19, 19);
+    put_f64(&mut stream, 21, 0.0);
+    put_f64(&mut stream, 29, 1.0);
+    put_f64(&mut stream, 37, 0.0);
+    put_f64(&mut stream, 45, 0.25);
+    let graph = Graph::parse(&stream);
+    let node = graph
+        .get(NodeKind::SweptSurface, 6)
+        .expect("swept surface node");
+    let state = node.swept_surface().expect("swept surface state");
+    assert_eq!(state.profile, 19);
+    assert_eq!(state.direction, [0.0, 1.0, 0.0]);
+    assert_eq!(state.auxiliary, 0.25);
 }

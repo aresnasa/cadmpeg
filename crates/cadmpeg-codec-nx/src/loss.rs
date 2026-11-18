@@ -75,6 +75,9 @@ loss_codes! {
     /// Geometric completion reached a declared work bound before all
     /// intersection pcurve lanes were complete.
     IntersectionPcurveCompletionBounded => ("intersection.pcurve-completion-bounded", Warning, ObjectRecordsUntransferred),
+    /// An edge sub-span was carried by the interior of a solved `CHART_s`
+    /// polyline instead of exact terminators. The carrier is a sampled cache.
+    IntersectionChartSubspanInferred => ("intersection.chart-subspan-inferred", Warning, GeometryAgreementSampled),
     /// Adaptive geometry certification reached its model-wide work bound.
     GeometryAdaptiveWorkBounded => ("geometry.adaptive-work-bounded", Warning, ObjectRecordsUntransferred),
     /// Physical Deltas records do not establish the selected aggregate state.
@@ -111,6 +114,10 @@ loss_codes! {
     AssemblyComponentsExternal => ("assembly.components-external", Blocking, AssemblyComponentsExternal),
     /// A carrier record of the right family states lanes the IR carrier refuses.
     CarrierLanesUnpaired => ("carrier.lanes-unpaired", Warning, ObjectRecordsUntransferred),
+    /// A `SWEPT_SURF` finite sweep interval was inferred from adjacent face vertices.
+    SweptSurfaceDomainInferred => ("surface.swept-domain-inferred", Info, CarrierSummary),
+    /// A `SWEPT_SURF` profile is not a boundary curve of its adjacent face.
+    SweptSurfaceProfileUnverified => ("surface.swept-profile-unverified", Warning, GeometryAgreementSampled),
     /// No gate-passing analytic carrier was found in the Parasolid streams.
     GeometryNotTransferred => ("geometry.not-transferred", Blocking, GeometryNotTransferred),
     /// A face loop states no resolvable coedge ring and is omitted from its face.
@@ -131,6 +138,9 @@ loss_codes! {
     /// A Display-JT polygon mesh did not resolve to a tessellation and was
     /// skipped.
     DisplayJtTessellationsDropped => ("carrier.display-jt-tessellations-dropped", Warning, ObjectRecordsUntransferred),
+    /// A Display-JT mesh declared vertex normals that were not decoded; the
+    /// mesh is kept without a normal lane.
+    DisplayJtNormalsDropped => ("carrier.display-jt-normals-dropped", Warning, ObjectRecordsUntransferred),
     /// Native object-model attachment failed; none of its records were kept.
     NativeAttachmentFailed => ("native.attachment-failed", Error, DecodeDiagnostic),
 }
@@ -196,6 +206,7 @@ mod tests {
                 "topology.graph-not-reconstructed",
                 "intersection.records-opaque",
                 "intersection.pcurve-completion-bounded",
+                "intersection.chart-subspan-inferred",
                 "geometry.adaptive-work-bounded",
                 "deltas.selection-unresolved",
                 "history.sub-body-composition-unresolved",
@@ -214,6 +225,8 @@ mod tests {
                 "stream.non-parasolid-omitted",
                 "assembly.components-external",
                 "carrier.lanes-unpaired",
+                "surface.swept-domain-inferred",
+                "surface.swept-profile-unverified",
                 "geometry.not-transferred",
                 "topology.loop-ring-unresolved",
                 "topology.face-loop-unresolved",
@@ -222,6 +235,7 @@ mod tests {
                 "native.record-identity-bounded",
                 "container.display-jt-arithmetic-lane-bounded",
                 "carrier.display-jt-tessellations-dropped",
+                "carrier.display-jt-normals-dropped",
                 "native.attachment-failed",
             ]
         );

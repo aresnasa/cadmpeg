@@ -101,6 +101,47 @@ fn complete_frame(
     xmt: u32,
     shift: usize,
 ) -> Option<FixedRecordFrame> {
+    if kind == NodeKind::Intersection {
+        return complete_intersection_frame(stream, pos, xmt, shift);
+    }
+    complete_frame_len(stream, pos, kind, len, xmt, shift)
+}
+
+/// Select the NX10 five-reference type-38 frame (29 bytes) when it reaches a
+/// record boundary and the canonical six-reference frame (31 bytes) does not.
+/// When neither or both reach a boundary, keep the longer form.
+fn complete_intersection_frame(
+    stream: &[u8],
+    pos: usize,
+    xmt: u32,
+    shift: usize,
+) -> Option<FixedRecordFrame> {
+    let compact = complete_frame_len(stream, pos, NodeKind::Intersection, 29, xmt, shift);
+    let long = complete_frame_len(stream, pos, NodeKind::Intersection, 31, xmt, shift);
+    match (compact, long) {
+        (Some(compact), Some(long)) => {
+            let compact_boundary = fixed_record_boundary(stream, compact.end());
+            let long_boundary = fixed_record_boundary(stream, long.end());
+            Some(if compact_boundary && !long_boundary {
+                compact
+            } else {
+                long
+            })
+        }
+        (Some(compact), None) => Some(compact),
+        (None, Some(long)) => Some(long),
+        (None, None) => None,
+    }
+}
+
+fn complete_frame_len(
+    stream: &[u8],
+    pos: usize,
+    kind: NodeKind,
+    len: usize,
+    xmt: u32,
+    shift: usize,
+) -> Option<FixedRecordFrame> {
     let xmt = NonNullXmt::try_from(xmt).ok()?;
     let payload_shift = payload_shift(stream, pos, kind, shift)?;
     let end = pos
@@ -127,6 +168,9 @@ pub(crate) fn fixed_record_boundary(stream: &[u8], end: usize) -> bool {
     if crate::topology::intersection_data_schema_header_at(stream, end) {
         return true;
     }
+    if chart_s_start(stream, end) {
+        return true;
+    }
     let Some(&kind) = end.checked_add(1).and_then(|at| stream.get(at)) else {
         return false;
     };
@@ -141,6 +185,18 @@ pub(crate) fn fixed_record_boundary(stream: &[u8], end: usize) -> bool {
         .flatten()
         .next()
         .is_some()
+}
+
+/// Whether a CHART_s (`0x28`) record starts at `pos`.
+///
+/// CHART_s is not a graph node, but it is a complete source record and therefore
+/// bounds the fixed record before it.
+fn chart_s_start(stream: &[u8], pos: usize) -> bool {
+    if stream.get(pos..pos + 2) != Some(&[0, 0x28]) {
+        return false;
+    }
+    let escape = usize::from(stream.get(pos + 2) == Some(&0xff));
+    View::u32_be_at(stream, pos + 2 + escape).is_some_and(|count| count > 0)
 }
 
 /// Parasolid `MEMBER_OF_FEATURE` record tag.
@@ -230,6 +286,11 @@ pub(crate) fn insert_unique<T>(
 }
 
 fn payload_shift(stream: &[u8], pos: usize, kind: NodeKind, header_shift: usize) -> Option<usize> {
+    if kind == NodeKind::SweptSurface {
+        // The compact record length already includes the profile reference and
+        // the four tail f64 values.
+        return Some(0);
+    }
     if kind == NodeKind::Face {
         let mut at = pos + face::ATTRIBUTES + header_shift;
         let start = at;
@@ -349,6 +410,7 @@ pub(crate) fn fixed_len(kind: NodeKind) -> usize {
         NodeKind::Sphere => sphere::LEN,
         NodeKind::Torus => torus::LEN,
         NodeKind::BlendSurface => 66,
+        NodeKind::SweptSurface => 53,
         NodeKind::OffsetSurface => offset_surf::LEN,
         NodeKind::BSurface | NodeKind::BCurve => 23,
         NodeKind::TrimmedCurve => trimmed::LEN,
@@ -359,6 +421,70 @@ pub(crate) fn fixed_len(kind: NodeKind) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{fixed_record_boundary, read_sequence_at, skip_sequence_at};
+    use crate::framing::node_kind::NodeKind;
+    use crate::test_support::test_bytes::{put_f64, put_ref, record};
+
+    fn point_record(xmt: u16) -> Vec<u8> {
+        let mut point = record(29, 40);
+        put_ref(&mut point, 2, xmt);
+        for index in 0..4 {
+            put_ref(&mut point, 8 + index * 2, 1);
+        }
+        put_f64(&mut point, 16, 0.0);
+        put_f64(&mut point, 24, 0.0);
+        put_f64(&mut point, 32, 0.0);
+        point
+    }
+
+    fn intersection_record(xmt: u16, support_refs: usize) -> Vec<u8> {
+        let mut intersection = record(38, 19 + support_refs * 2);
+        put_ref(&mut intersection, 2, xmt);
+        for index in 0..5 {
+            put_ref(&mut intersection, 8 + index * 2, 1);
+        }
+        intersection[18] = b'+';
+        for index in 0..support_refs {
+            put_ref(&mut intersection, 19 + index * 2, 1);
+        }
+        intersection
+    }
+
+    #[test]
+    fn swept_surface_frame_covers_profile_and_tail() {
+        assert_eq!(super::fixed_len(NodeKind::SweptSurface), 53);
+        let mut swept = record(67, 53);
+        put_ref(&mut swept, 2, 6);
+        for index in 0..5 {
+            put_ref(&mut swept, 8 + index * 2, 1);
+        }
+        swept[18] = b'+';
+        put_ref(&mut swept, 19, 19);
+        put_f64(&mut swept, 21, 0.0);
+        put_f64(&mut swept, 29, 1.0);
+        put_f64(&mut swept, 37, 0.0);
+        put_f64(&mut swept, 45, 0.0);
+        let frame = super::fixed_record_candidates(&swept, 0, NodeKind::SweptSurface)[0].unwrap();
+        assert_eq!(frame.end(), 53);
+        assert_eq!(frame.payload_shift(), 0);
+    }
+
+    #[test]
+    fn type_38_five_reference_frame_ends_at_29() {
+        let mut stream = intersection_record(304, 5);
+        stream.extend(point_record(7));
+        let frame = super::fixed_record_candidates(&stream, 0, NodeKind::Intersection)[0].unwrap();
+        assert_eq!(frame.end(), 29);
+        assert!(fixed_record_boundary(&stream, frame.end()));
+    }
+
+    #[test]
+    fn type_38_six_reference_frame_ends_at_31() {
+        let mut stream = intersection_record(304, 6);
+        stream.extend(point_record(7));
+        let frame = super::fixed_record_candidates(&stream, 0, NodeKind::Intersection)[0].unwrap();
+        assert_eq!(frame.end(), 31);
+        assert!(fixed_record_boundary(&stream, frame.end()));
+    }
 
     #[test]
     fn member_of_feature_frame_with_an_owner_is_a_record_boundary() {

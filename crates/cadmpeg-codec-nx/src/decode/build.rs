@@ -42,17 +42,21 @@ use cadmpeg_ir::codec::DecodeBody;
 use cadmpeg_ir::document::CadIr;
 use cadmpeg_ir::features::FinitePoint3;
 use cadmpeg_ir::geometry::{
-    pcurve::Pcurve, BlendCrossSection, BlendRadiusLaw, BlendSupport, Curve, CurveGeometry,
-    IntcurveSupportContext, ProceduralCurve, ProceduralCurveDefinition, ProceduralSurface,
-    ProceduralSurfaceDefinition, SolvedCurveGeometry, SolvedSurfaceGeometry, Surface,
-    SurfaceGeometry,
+    nurbs::{
+        NurbsCurve, NurbsPoleGrid, NurbsPoles3, NurbsSurface, NurbsSurfaceAxis, WeightedPole3,
+    },
+    pcurve::Pcurve,
+    BlendCrossSection, BlendRadiusLaw, BlendSupport, Curve, CurveGeometry, IntcurveSupportContext,
+    ProceduralCurve, ProceduralCurveDefinition, ProceduralSurface, ProceduralSurfaceDefinition,
+    SolvedCurveGeometry, SolvedSurfaceGeometry, Surface, SurfaceGeometry,
 };
 use cadmpeg_ir::ids::{
     BodyId, CoedgeId, CurveId, EdgeId, FaceId, LoopId, PcurveId, PointId, ProceduralCurveId,
     ProceduralSurfaceId, RegionId, ShellId, SurfaceId, UnknownId, VertexId,
 };
+use cadmpeg_ir::math::Point3;
 use cadmpeg_ir::report::loss::LossNote;
-use cadmpeg_ir::topology::{Body, BodyKind, Point, Region, Shell, Vertex};
+use cadmpeg_ir::topology::{Body, BodyKind, Point, Region, Sense, Shell, Vertex};
 use cadmpeg_ir::unknown::UnknownRecord;
 use cadmpeg_ir::{AnnotationBuilder, Exactness, SourceObjectAssociation};
 use std::collections::{BTreeMap, BTreeSet};
@@ -95,6 +99,446 @@ fn ordered_fixed_candidates<T>(
         }
     }
     candidates.into_values().collect()
+}
+
+const MAX_SWEPT_FACE_FINS: usize = 100_000;
+const MAX_SWEPT_FACE_LOOPS: usize = 1024;
+const SWEPT_PROFILE_SPREAD_MM: f64 = 1.0e-3;
+const SWEPT_ROW_MATCH_MM: f64 = 1.0e-3;
+const SWEPT_DOMAIN_MARGIN_MM: f64 = 1.0e-4;
+
+fn clone_nurbs_curve(ir: &CadIr, id: &CurveId) -> Option<NurbsCurve> {
+    ir.model
+        .curves
+        .iter()
+        .find(|curve| &curve.id == id)
+        .and_then(|curve| match &curve.geometry {
+            CurveGeometry::Solved(SolvedCurveGeometry::Nurbs(nurbs)) => Some(nurbs.clone()),
+            _ => None,
+        })
+}
+
+fn nurbs_pole_points(poles: &NurbsPoles3<FinitePoint3>) -> Vec<FinitePoint3> {
+    match poles {
+        NurbsPoles3::Polynomial { points } => points.clone(),
+        NurbsPoles3::Rational { points } => points.iter().map(|pole| pole.point).collect(),
+    }
+}
+
+fn sweep_projection(point: FinitePoint3, direction: [f64; 3]) -> f64 {
+    let point = point.get();
+    point.x * direction[0] + point.y * direction[1] + point.z * direction[2]
+}
+
+fn curve_projection_range(curve: &NurbsCurve, direction: [f64; 3]) -> Option<(f64, f64)> {
+    let (_, _, poles, _) = curve.clone().into_parts();
+    let points = nurbs_pole_points(&poles);
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for point in points {
+        let value = sweep_projection(point, direction);
+        if !value.is_finite() {
+            return None;
+        }
+        low = low.min(value);
+        high = high.max(value);
+    }
+    (low.is_finite() && high.is_finite()).then_some((low, high))
+}
+
+fn translate_point(
+    point: FinitePoint3,
+    direction: [f64; 3],
+    distance: f64,
+) -> Option<FinitePoint3> {
+    let point = point.get();
+    FinitePoint3::new(Point3::new(
+        point.x + direction[0] * distance,
+        point.y + direction[1] * distance,
+        point.z + direction[2] * distance,
+    ))
+}
+
+fn same_poles(left: &[FinitePoint3], right: &[FinitePoint3]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            let left = left.get();
+            let right = right.get();
+            let distance = ((left.x - right.x).powi(2)
+                + (left.y - right.y).powi(2)
+                + (left.z - right.z).powi(2))
+            .sqrt();
+            distance.is_finite() && distance <= SWEPT_ROW_MATCH_MM
+        })
+}
+
+fn profile_matches_boundary(
+    ir: &CadIr,
+    curves_by_xmt: &BTreeMap<u32, CurveId>,
+    boundary_curves: &BTreeSet<u32>,
+    profile: &NurbsCurve,
+    direction: [f64; 3],
+    t_low: f64,
+    t_high: f64,
+) -> bool {
+    let (_, _, profile_poles, _) = profile.clone().into_parts();
+    let profile_points = nurbs_pole_points(&profile_poles);
+    for curve_xmt in boundary_curves {
+        let Some(id) = curves_by_xmt.get(curve_xmt) else {
+            continue;
+        };
+        let Some(curve) = clone_nurbs_curve(ir, id) else {
+            continue;
+        };
+        let (_, _, poles, _) = curve.into_parts();
+        let points = nurbs_pole_points(&poles);
+        if points.len() != profile_points.len() {
+            continue;
+        }
+        for distance in [t_low, t_high] {
+            let Some(translated) = profile_points
+                .iter()
+                .map(|point| translate_point(*point, direction, distance))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if same_poles(&points, &translated) {
+                return true;
+            }
+            let mut reversed = translated;
+            reversed.reverse();
+            if same_poles(&points, &reversed) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn walk_swept_fin_ring(
+    graph: &Graph,
+    first_fin: u32,
+    points: &mut Vec<FinitePoint3>,
+    boundary_curves: &mut BTreeSet<u32>,
+) {
+    let mut current = first_fin;
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_SWEPT_FACE_FINS {
+        if !seen.insert(current) {
+            break;
+        }
+        let Some(fin) = graph.get(NodeKind::Fin, current) else {
+            break;
+        };
+        let Some(fields) = fin.fin_fields() else {
+            break;
+        };
+        if let Some(vertex) = fields.vertex {
+            let point = graph
+                .get(NodeKind::Vertex, u32::from(vertex))
+                .and_then(Node::vertex_fields)
+                .and_then(|fields| fields.point)
+                .and_then(|point| graph.get(NodeKind::Point, u32::from(point)))
+                .and_then(Node::point_position);
+            if let Some(point) = point {
+                points.push(point);
+            }
+        }
+        if let Some(edge) = fields.edge {
+            if let Some(curve) = graph
+                .get(NodeKind::Edge, u32::from(edge))
+                .and_then(Node::edge_fields)
+                .and_then(|fields| fields.curve)
+            {
+                boundary_curves.insert(u32::from(curve));
+            }
+        }
+        if let Some(curve) = fields.curve_xmt {
+            boundary_curves.insert(u32::from(curve));
+        }
+        let Some(next) = fields.forward else {
+            break;
+        };
+        current = u32::from(next);
+    }
+}
+
+fn collect_swept_face_data(
+    graph: &Graph,
+    face: &Node,
+    points: &mut Vec<FinitePoint3>,
+    boundary_curves: &mut BTreeSet<u32>,
+) -> Option<()> {
+    let fields = face.face_fields()?;
+    let mut loop_xmt = fields.loop_xmt?;
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_SWEPT_FACE_LOOPS {
+        if !seen.insert(u32::from(loop_xmt)) {
+            break;
+        }
+        let loop_node = graph.get(NodeKind::Loop, u32::from(loop_xmt))?;
+        let loop_fields = loop_node.loop_fields()?;
+        if let Some(fin) = loop_fields.fin {
+            walk_swept_fin_ring(graph, u32::from(fin), points, boundary_curves);
+        }
+        let Some(next) = loop_fields.next_loop else {
+            break;
+        };
+        loop_xmt = next;
+    }
+    Some(())
+}
+
+fn select_swept_profile(
+    ir: &CadIr,
+    curves_by_xmt: &BTreeMap<u32, CurveId>,
+    profile_xmt: u32,
+    boundary_curves: &BTreeSet<u32>,
+    direction: [f64; 3],
+) -> Option<(NurbsCurve, bool)> {
+    if let Some(id) = curves_by_xmt.get(&profile_xmt) {
+        if let Some(curve) = clone_nurbs_curve(ir, id) {
+            return Some((curve, true));
+        }
+    }
+    let mut best: Option<(f64, NurbsCurve)> = None;
+    for curve_xmt in boundary_curves {
+        let Some(id) = curves_by_xmt.get(curve_xmt) else {
+            continue;
+        };
+        let Some(curve) = clone_nurbs_curve(ir, id) else {
+            continue;
+        };
+        let Some((low, high)) = curve_projection_range(&curve, direction) else {
+            continue;
+        };
+        let spread = high - low;
+        if spread.is_finite()
+            && spread <= SWEPT_PROFILE_SPREAD_MM
+            && best
+                .as_ref()
+                .is_none_or(|(best_spread, _)| spread < *best_spread)
+        {
+            best = Some((spread, curve));
+        }
+    }
+    best.map(|(_, curve)| (curve, false))
+}
+
+fn swept_surface_nurbs(
+    profile: NurbsCurve,
+    direction: [f64; 3],
+    low: f64,
+    high: f64,
+    normal_reversed: bool,
+) -> Option<NurbsSurface> {
+    let (degree, knots, poles, periodic) = profile.into_parts();
+    let rows = match poles {
+        NurbsPoles3::Polynomial { points } => {
+            let first = points
+                .iter()
+                .map(|point| translate_point(*point, direction, low))
+                .collect::<Option<Vec<_>>>()?;
+            let second = points
+                .iter()
+                .map(|point| translate_point(*point, direction, high))
+                .collect::<Option<Vec<_>>>()?;
+            NurbsPoleGrid::Polynomial {
+                rows: vec![first, second],
+            }
+        }
+        NurbsPoles3::Rational { points } => {
+            let first = points
+                .iter()
+                .map(|pole| {
+                    Some(WeightedPole3 {
+                        point: translate_point(pole.point, direction, low)?,
+                        weight: pole.weight,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let second = points
+                .iter()
+                .map(|pole| {
+                    Some(WeightedPole3 {
+                        point: translate_point(pole.point, direction, high)?,
+                        weight: pole.weight,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            NurbsPoleGrid::Rational {
+                rows: vec![first, second],
+            }
+        }
+    };
+    NurbsSurface::new(
+        NurbsSurfaceAxis::new(1, vec![0.0, 0.0, 1.0, 1.0], false),
+        NurbsSurfaceAxis::new(degree, knots.as_slice().to_vec(), periodic),
+        rows,
+        normal_reversed,
+    )
+    .ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_swept_surfaces(
+    ir: &mut CadIr,
+    graph: &Graph,
+    surfaces_by_xmt: &mut BTreeMap<u32, SurfaceId>,
+    curves_by_xmt: &BTreeMap<u32, CurveId>,
+    counts: &mut Counts,
+    annotations: &mut AnnotationBuilder,
+    scope: &IdScope,
+    source_stream: &StreamHandle,
+    stream_index: usize,
+    losses: &mut Vec<LossNote>,
+) -> Result<(), CodecError> {
+    let mut emitted = 0usize;
+    for node in graph.of_kind(NodeKind::SweptSurface) {
+        let xmt = node.xmt();
+        if surfaces_by_xmt.contains_key(&xmt) {
+            continue;
+        }
+        let Some(state) = node.swept_surface() else {
+            continue;
+        };
+        let norm = state
+            .direction
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        if !norm.is_finite() || norm <= 1.0e-12 {
+            continue;
+        }
+        let direction = [
+            state.direction[0] / norm,
+            state.direction[1] / norm,
+            state.direction[2] / norm,
+        ];
+
+        let mut points = Vec::new();
+        let mut boundary_curves = BTreeSet::new();
+        let mut face_count = 0usize;
+        for face in graph.of_kind(NodeKind::Face) {
+            let Some(fields) = face.face_fields() else {
+                continue;
+            };
+            if fields.surface.map(u32::from) != Some(xmt) {
+                continue;
+            }
+            face_count += 1;
+            let _ = collect_swept_face_data(graph, face, &mut points, &mut boundary_curves);
+        }
+        if face_count == 0 || points.len() < 2 {
+            continue;
+        }
+
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        for point in &points {
+            let value = sweep_projection(*point, direction);
+            if !value.is_finite() {
+                continue;
+            }
+            low = low.min(value);
+            high = high.max(value);
+        }
+        if !(low.is_finite() && high.is_finite()) || high - low <= 1.0e-7 {
+            continue;
+        }
+
+        let Some((profile, explicit)) = select_swept_profile(
+            ir,
+            curves_by_xmt,
+            state.profile,
+            &boundary_curves,
+            direction,
+        ) else {
+            losses.push(NxLossCode::SweptSurfaceProfileUnverified.note(format!(
+                "parasolid#{stream_index} SWEPT_SURF {xmt} has no decoded NURBS profile (record profile {})",
+                state.profile
+            )));
+            continue;
+        };
+        let (profile_low, profile_high) = match curve_projection_range(&profile, direction) {
+            Some(range) => range,
+            None => continue,
+        };
+        let profile_spread = profile_high - profile_low;
+        let anchor = profile_low;
+        let t_low = low - anchor - SWEPT_DOMAIN_MARGIN_MM;
+        let t_high = high - anchor + SWEPT_DOMAIN_MARGIN_MM;
+        if !(t_high.is_finite() && t_low.is_finite()) || t_high - t_low <= 1.0e-7 {
+            continue;
+        }
+        if !profile_matches_boundary(
+            ir,
+            curves_by_xmt,
+            &boundary_curves,
+            &profile,
+            direction,
+            t_low,
+            t_high,
+        ) {
+            losses.push(NxLossCode::SweptSurfaceProfileUnverified.note(format!(
+                "parasolid#{stream_index} SWEPT_SURF {xmt} profile {} is not a boundary row of its adjacent faces",
+                state.profile
+            )));
+            continue;
+        }
+        let normal_reversed = node
+            .common_header()
+            .is_some_and(|(sense, _)| sense == Sense::Reversed);
+        let Some(surface) = swept_surface_nurbs(profile, direction, t_low, t_high, normal_reversed)
+        else {
+            losses.push(NxLossCode::SweptSurfaceProfileUnverified.note(format!(
+                "parasolid#{stream_index} SWEPT_SURF {xmt} profile cannot build a surface"
+            )));
+            continue;
+        };
+
+        let id: SurfaceId =
+            scope.id_from_display(&cadmpeg_ir::identity_component!("swept-surf"), emitted)?;
+        annotations.note(
+            id.as_str(),
+            source_stream,
+            cadmpeg_core::decode::u64_from_index(node.pos()),
+            Some("SWEPT_SURF_NURBS"),
+        );
+        annotations.derived(id.as_str(), "geometry")?;
+        annotations.exactness(id.as_str(), Exactness::Derived);
+        ir.model.surfaces.push(Surface {
+            id: id.clone(),
+            geometry: SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(surface)),
+            source_object: Some(SourceObjectAssociation {
+                geometry_role: None,
+                format: cadmpeg_ir::CodecFormat::Nx,
+                object_id: cadmpeg_core::text::NonBlankString::new(format!(
+                    "nx:s{stream_index}:swept-surface-record#{xmt}"
+                ))
+                .ok_or_else(|| {
+                    cadmpeg_core::CodecError::malformed("source object_id must not be empty")
+                })?,
+                name: None,
+                color: None,
+                visible: None,
+                layer: None,
+                instance_path: Vec::new(),
+            }),
+        });
+        surfaces_by_xmt.insert(xmt, id);
+        counts.swept_surfaces += 1;
+        emitted += 1;
+        losses.push(NxLossCode::SweptSurfaceDomainInferred.note(format!(
+            "parasolid#{stream_index} SWEPT_SURF {xmt} profile {} direction [{:.6},{:.6},{:.6}] \
+             v=[{t_low:.6},{t_high:.6}] mm (face-vertex extent [{low:.6},{high:.6}], profile anchor {anchor:.6}, \
+             profile spread {profile_spread:.6}, explicit={explicit}, aux={:.6})",
+            state.profile, direction[0], direction[1], direction[2], state.auxiliary
+        )));
+    }
+    Ok(())
 }
 
 /// Decode analytic carriers from every Parasolid stream. Returns `None` when no
@@ -644,6 +1088,19 @@ pub(super) fn try_decode_geometry(
             }
         }
 
+        admit_swept_surfaces(
+            &mut ir,
+            graph,
+            &mut surfaces_by_xmt,
+            &curves_by_xmt,
+            &mut counts,
+            &mut annotations,
+            &scope,
+            &source_stream,
+            si,
+            &mut carrier_refusals,
+        )?;
+
         for (pi, pcurve) in nurbs_pcurves.into_iter().enumerate() {
             let id: PcurveId =
                 scope.id_from_display(&cadmpeg_ir::identity_component!("pcurve"), pi)?;
@@ -812,6 +1269,28 @@ pub(super) fn try_decode_geometry(
                         ext11: [ext_first?, ext_second?],
                     },
                 ));
+            }
+            if let Some(fit) = charted.and_then(|charted| charted.subspan) {
+                let chart_xmt = charted
+                    .and_then(|charted| charted.references[2])
+                    .map_or(0, |target| u32::from(target));
+                carrier_refusals.push(NxLossCode::IntersectionChartSubspanInferred.note(format!(
+                    "parasolid#{si} curve#{} uses an interior sub-span of CHART_s #{chart_xmt} at byte {}: \
+                     fit tolerance {:.6} mm, vertex snap {:.6} mm / {:.6} mm; the carrier is the \
+                     sampled solved chart cache, not an exact intersection",
+                    construction.xmt,
+                    fit.chart_pos,
+                    charted.map_or(0.0, |charted| charted.fit_tolerance.get()),
+                    fit.start_distance,
+                    fit.end_distance,
+                )));
+                annotations.note(
+                    curve_id.as_str(),
+                    &source_stream,
+                    cadmpeg_core::decode::u64_from_index(construction.pos),
+                    Some("INTERSECTION_CHART_SUBSPAN"),
+                );
+                annotations.exactness(curve_id.as_str(), Exactness::Inferred);
             }
             annotations.note(
                 curve_id.as_str(),

@@ -732,7 +732,7 @@ pub(crate) fn frame_int32_cdp2(
     depth: u8,
 ) -> Result<Option<(u32, u8, usize)>, CodecError> {
     let decoded: Option<Result<_, CodecError>> = (|| {
-        if depth > 3 {
+        if depth > MAX_CDP2_DEPTH {
             return None;
         }
         let _depth = propagate_resource!(ctx.enter_nested("frame JT integer packet"));
@@ -895,9 +895,12 @@ impl CodeBits<'_> {
 }
 
 /// Upper bound on values a single arithmetic-coded lane may declare.
-const MAX_ARITHMETIC_VALUES: usize = 1_000_000;
+pub(crate) const MAX_ARITHMETIC_VALUES: usize = 1_000_000;
 /// Upper bound on arithmetic decoder table lookups for one lane.
 pub(crate) const MAX_ARITHMETIC_WORK: usize = 64_000_000;
+/// Deepest admitted Int32 packet chain: three chopper levels plus the
+/// out-of-band level.
+const MAX_CDP2_DEPTH: u8 = 4;
 
 /// Whether any arithmetic-coded lane was left undecoded at
 /// [`MAX_ARITHMETIC_WORK`].
@@ -1083,7 +1086,7 @@ pub(crate) fn decode_int32_cdp2(
     depth: u8,
 ) -> Result<Option<(Vec<i32>, usize)>, CodecError> {
     let decoded: Option<Result<_, CodecError>> = (|| {
-        if depth > 3 {
+        if depth > MAX_CDP2_DEPTH {
             return None;
         }
         let _depth = propagate_resource!(ctx.enter_nested("decode JT integer packet"));

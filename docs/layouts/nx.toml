@@ -183,6 +183,24 @@ anchor = "`ff 00 45 01 04 01`. Twelve scalar atoms follow in row-major order as 
 value = [255, 0, 69, 1, 4, 1]
 
 [[record]]
+name = "assembly_placement_prefix_legacy"
+parsed_by = "crates/cadmpeg-codec-nx/src/native/assembly_placement.rs"
+kind = "byte"
+section = "2.3"
+anchor = "NX 10 writes the four-byte prefix `45 01 04 01`"
+size = 4
+endianness = "big"
+note = "The matrix follows the prefix; NX 10 frames are two bytes shorter than NX 12 frames."
+
+[[record.field]]
+name = "magic"
+offset = 0
+type = "bytes[4]"
+source = "spec"
+anchor = "`45 01 04 01`"
+value = [69, 1, 4, 1]
+
+[[record]]
 name = "splmsstr_header"
 parsed_by = "crates/cadmpeg-codec-nx/src/container.rs"
 kind = "byte"
@@ -1106,6 +1124,14 @@ payload_bytes = 31
 note = "logical fixed record length"
 section = "4.1"
 anchor = "| 18 | VERTEX | 28 | 60 | OFFSET_SURF | 31 |"
+
+[[token]]
+tag = "67"
+name = "SWEPT_SURF"
+payload_bytes = 53
+note = "logical fixed record length; tail is profile XMT plus direction xyz and auxiliary f64"
+section = "4.1"
+anchor = "`SWEPT_SURF` (67) is a 53-byte fixed record"
 
 [[token]]
 tag = "124"

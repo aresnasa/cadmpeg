@@ -8,7 +8,10 @@ use std::io::{self, BufRead, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use cadmpeg_codec_nx::{assembly_placements, read_part_attributes, set_part_attribute, NxCodec};
+use cadmpeg_codec_nx::{
+    assembly_placements, read_assembly_manifest, read_part_attributes, relink_assembly,
+    set_part_attribute, NxCodec,
+};
 use cadmpeg_ir::codec::{Codec, DecodeOptions};
 use cadmpeg_ir::math::{Point3, Vector3};
 use cadmpeg_tessellate::{Options, Tessellator};
@@ -19,23 +22,24 @@ use serde_json::json;
 #[cfg(feature = "viewer")]
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
+mod assembly_mesh;
 mod cam;
 
 #[derive(Default)]
-struct MeshData {
-    positions: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-    indices: Vec<u32>,
-    cam_points: Vec<[f32; 3]>,
-    cam_sections: Vec<usize>,
-    cam_edges: Vec<[u32; 2]>,
-    cam_rapid: Vec<bool>,
-    faces_tessellated: usize,
-    faces_refused: usize,
+pub(crate) struct MeshData {
+    pub(crate) positions: Vec<[f32; 3]>,
+    pub(crate) normals: Vec<[f32; 3]>,
+    pub(crate) indices: Vec<u32>,
+    pub(crate) cam_points: Vec<[f32; 3]>,
+    pub(crate) cam_sections: Vec<usize>,
+    pub(crate) cam_edges: Vec<[u32; 2]>,
+    pub(crate) cam_rapid: Vec<bool>,
+    pub(crate) faces_tessellated: usize,
+    pub(crate) faces_refused: usize,
 }
 
 impl MeshData {
-    fn add(
+    pub(crate) fn add(
         &mut self,
         positions: &[Point3],
         normals: &[Vector3],
@@ -299,6 +303,42 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        "assembly" => {
+            assembly_command(&mut args)?;
+        }
+        "gear" => {
+            let path = PathBuf::from(args.next().context("usage: nxview gear <part.prt>")?);
+            gear_report(&path)?;
+        }
+        "gear-profile" => {
+            let path = PathBuf::from(
+                args.next()
+                    .context("usage: nxview gear-profile <part.prt> [bins]")?,
+            );
+            let bins = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1440);
+            gear_profile_report(&path, bins)?;
+        }
+        "surfaces" => {
+            let path = PathBuf::from(args.next().context("usage: nxview surfaces <part.prt>")?);
+            let mut input = File::open(&path)?;
+            let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
+            let mut surfaces = Vec::new();
+            for surface in &result.ir().model.surfaces {
+                let geometry = surface.geometry.solved().map_or_else(
+                    || serde_json::to_value(&surface.geometry),
+                    serde_json::to_value,
+                )?;
+                surfaces.push(json!({
+                    "id": surface.id.as_str(),
+                    "source_object": surface.source_object,
+                    "geometry": geometry,
+                }));
+            }
+            println!("{}", serde_json::to_string_pretty(&surfaces)?);
+        }
         "attr" => {
             let action = args.next().context(
                 "usage: nxview attr get <part.prt> | nxview attr set <in.prt> <out.prt> <title> <value>",
@@ -310,6 +350,34 @@ fn main() -> anyhow::Result<()> {
                     for attribute in cadmpeg_codec_nx::read_part_attributes(&path)? {
                         println!("{}\t{}", attribute.title, attribute.value);
                     }
+                }
+                "apply" => {
+                    let input = PathBuf::from(
+                        args.next()
+                            .context("usage: nxview attr apply <in.prt> <out.prt> <edits.json>")?,
+                    );
+                    let output = PathBuf::from(
+                        args.next()
+                            .context("usage: nxview attr apply <in.prt> <out.prt> <edits.json>")?,
+                    );
+                    let edits_path = PathBuf::from(
+                        args.next()
+                            .context("usage: nxview attr apply <in.prt> <out.prt> <edits.json>")?,
+                    );
+                    let edits: serde_json::Map<String, serde_json::Value> =
+                        serde_json::from_str(&fs::read_to_string(&edits_path)?)?;
+                    let edits: Vec<(String, String)> = edits
+                        .into_iter()
+                        .map(|(title, value)| {
+                            let value = match value {
+                                serde_json::Value::String(text) => text,
+                                other => other.to_string(),
+                            };
+                            (title, value)
+                        })
+                        .collect();
+                    apply_pending(&input, &output, &edits)?;
+                    println!("wrote {}", output.display());
                 }
                 "set" => {
                     let input = PathBuf::from(
@@ -337,6 +405,34 @@ fn main() -> anyhow::Result<()> {
                 other => bail!("unknown attr action: {other}"),
             }
         }
+        "stream" => {
+            let action = args.next().context(
+                "usage: nxview stream replace <in.prt> <out.prt> <stream-path> <payload-file>",
+            )?;
+            if action != "replace" {
+                bail!(
+                    "usage: nxview stream replace <in.prt> <out.prt> <stream-path> <payload-file>"
+                );
+            }
+            let input = PathBuf::from(args.next().context(
+                "usage: nxview stream replace <in.prt> <out.prt> <stream-path> <payload-file>",
+            )?);
+            let output = PathBuf::from(args.next().context(
+                "usage: nxview stream replace <in.prt> <out.prt> <stream-path> <payload-file>",
+            )?);
+            let stream = args.next().context(
+                "usage: nxview stream replace <in.prt> <out.prt> <stream-path> <payload-file>",
+            )?;
+            let payload_path = PathBuf::from(args.next().context(
+                "usage: nxview stream replace <in.prt> <out.prt> <stream-path> <payload-file>",
+            )?);
+            let payload = fs::read(&payload_path)?;
+            let report = cadmpeg_codec_nx::replace_cfb_stream(&input, &output, &stream, &payload)?;
+            println!("wrote {}", report.output.display());
+            println!("changed_streams={:?}", report.changed_streams);
+            println!("source_sha256={}", report.source_sha256);
+            println!("output_sha256={}", report.output_sha256);
+        }
         other => {
             // Treat the first argument as a path for convenience.
             let path = PathBuf::from(other);
@@ -344,6 +440,658 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn assembly_command(args: &mut impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let action = args
+        .next()
+        .context("usage: nxview assembly <info|export|relink|check|obj|render> ...")?;
+    match action.as_str() {
+        "info" => {
+            let mut path = None;
+            let mut root = None;
+            while let Some(argument) = args.next() {
+                match argument.as_str() {
+                    "--root" => {
+                        root = Some(PathBuf::from(
+                            args.next().context("usage: --root <directory>")?,
+                        ));
+                    }
+                    other => {
+                        if path.replace(PathBuf::from(other)).is_some() {
+                            bail!("usage: nxview assembly info <assembly.prt> [--root <dir>]");
+                        }
+                    }
+                }
+            }
+            let path = path.context("usage: nxview assembly info <assembly.prt> [--root <dir>]")?;
+            print_manifest(&path, root.as_deref())?;
+        }
+        "export" => {
+            let path = PathBuf::from(args.next().context(
+                "usage: nxview assembly export <assembly.prt> <out.json> [--root <dir>]",
+            )?);
+            let output = PathBuf::from(args.next().context(
+                "usage: nxview assembly export <assembly.prt> <out.json> [--root <dir>]",
+            )?);
+            let mut root = None;
+            while let Some(argument) = args.next() {
+                if argument == "--root" {
+                    root = Some(PathBuf::from(
+                        args.next().context("usage: --root <directory>")?,
+                    ));
+                } else {
+                    bail!("usage: nxview assembly export <assembly.prt> <out.json> [--root <dir>]");
+                }
+            }
+            let manifest = read_assembly_manifest(&path, root.as_deref())?;
+            let value = manifest_json(&manifest);
+            fs::write(&output, serde_json::to_string_pretty(&value)?)?;
+            println!("wrote {}", output.display());
+        }
+        "check" => {
+            let (positionals, root) = assembly_positionals(args)?;
+            let path = positionals
+                .first()
+                .context("usage: nxview assembly check <assembly.prt> [--root <dir>]")?;
+            let loaded =
+                crate::assembly_mesh::load_assembly_mesh(path, root.as_deref(), chord(0.5))?;
+            println!("{}", serde_json::to_string_pretty(&loaded.report)?);
+        }
+        "obj" => {
+            let (positionals, root) = assembly_positionals(args)?;
+            let path = positionals
+                .first()
+                .context("usage: nxview assembly obj <assembly.prt> <out.obj> [--root <dir>]")?;
+            let output = positionals
+                .get(1)
+                .context("usage: nxview assembly obj <assembly.prt> <out.obj> [--root <dir>]")?;
+            let loaded =
+                crate::assembly_mesh::load_assembly_mesh(path, root.as_deref(), chord(0.5))?;
+            if loaded.mesh.indices.is_empty() {
+                bail!("assembly has no renderable geometry");
+            }
+            write_obj(output, &loaded.mesh)?;
+            println!("wrote {}", output.display());
+            println!("{}", serde_json::to_string_pretty(&loaded.report)?);
+        }
+        "render" => {
+            let (positionals, root) = assembly_positionals(args)?;
+            let path = positionals.first().context(
+                "usage: nxview assembly render <assembly.prt> <out.ppm> [width] [height] [--root <dir>]",
+            )?;
+            let output = positionals.get(1).context(
+                "usage: nxview assembly render <assembly.prt> <out.ppm> [width] [height] [--root <dir>]",
+            )?;
+            let width = positionals
+                .get(2)
+                .and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1100);
+            let height = positionals
+                .get(3)
+                .and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(700);
+            if width == 0 || height == 0 || width > 8192 || height > 8192 {
+                bail!("render dimensions must be between 1 and 8192");
+            }
+            let loaded =
+                crate::assembly_mesh::load_assembly_mesh(path, root.as_deref(), chord(0.5))?;
+            let buffer = render_mesh_image(&loaded.mesh, width, height)?;
+            write_ppm(output, &buffer, width, height)?;
+            println!("wrote {} ({}x{})", output.display(), width, height);
+            println!("{}", serde_json::to_string_pretty(&loaded.report)?);
+        }
+        "relink" => {
+            let input = PathBuf::from(
+                args.next()
+                    .context("usage: nxview assembly relink <in.prt> <out.prt> <directory>")?,
+            );
+            let output = PathBuf::from(
+                args.next()
+                    .context("usage: nxview assembly relink <in.prt> <out.prt> <directory>")?,
+            );
+            let directory = PathBuf::from(
+                args.next()
+                    .context("usage: nxview assembly relink <in.prt> <out.prt> <directory>")?,
+            );
+            let report = relink_assembly(&input, &output, &directory)?;
+            println!("wrote {}", report.output.display());
+            println!("stream={}", report.stream);
+            println!(
+                "old_directory={}",
+                report.old_directory.as_deref().unwrap_or("")
+            );
+            println!("new_directory={}", report.new_directory);
+            println!("changed_strings={}", report.changed_strings.len());
+            println!("source_sha256={}", report.source_sha256);
+            println!("output_sha256={}", report.output_sha256);
+            println!("byte_identical={}", report.byte_identical);
+            let manifest = read_assembly_manifest(&output, Some(&directory))?;
+            let present = manifest
+                .components
+                .iter()
+                .filter(|component| component.present)
+                .count();
+            println!(
+                "components={} present={} missing={}",
+                manifest.components.len(),
+                present,
+                manifest.components.len() - present
+            );
+        }
+        other => bail!("unknown assembly action: {other}"),
+    }
+    Ok(())
+}
+
+fn assembly_positionals(
+    args: &mut impl Iterator<Item = String>,
+) -> anyhow::Result<(Vec<PathBuf>, Option<PathBuf>)> {
+    let mut positionals = Vec::new();
+    let mut root = None;
+    while let Some(argument) = args.next() {
+        if argument == "--root" {
+            root = Some(PathBuf::from(
+                args.next().context("usage: --root <directory>")?,
+            ));
+        } else {
+            positionals.push(PathBuf::from(argument));
+        }
+    }
+    Ok((positionals, root))
+}
+
+fn print_manifest(path: &Path, root: Option<&Path>) -> anyhow::Result<()> {
+    let manifest = read_assembly_manifest(path, root)?;
+    println!("source={}", manifest.source.display());
+    println!("stream={}", manifest.stream);
+    println!(
+        "directory={}",
+        manifest.directory.as_deref().unwrap_or("(none)")
+    );
+    println!("components={}", manifest.components.len());
+    for component in &manifest.components {
+        println!(
+            "  [{}] {} present={} path={}",
+            component.string_ordinal,
+            component.name,
+            component.present,
+            component.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn manifest_json(manifest: &cadmpeg_codec_nx::AssemblyManifest) -> serde_json::Value {
+    json!({
+        "source": manifest.source.display().to_string(),
+        "stream": manifest.stream,
+        "directory": manifest.directory,
+        "components": manifest.components.iter().map(|component| json!({
+            "name": component.name,
+            "string_ordinal": component.string_ordinal,
+            "path": component.path.display().to_string(),
+            "present": component.present,
+        })).collect::<Vec<_>>(),
+        "strings": manifest.strings,
+    })
+}
+
+fn load_vertices(path: &Path) -> anyhow::Result<Vec<[f64; 3]>> {
+    let mut input = File::open(path)?;
+    let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
+    let mut vertices = Vec::new();
+    for tessellation in &result.ir().model.tessellations {
+        for point in tessellation.vertices() {
+            let point = point.get();
+            vertices.push([point.x, point.y, point.z]);
+        }
+    }
+    if vertices.is_empty() && !result.ir().model.faces.is_empty() {
+        let options = Options {
+            chord: 0.5,
+            ..Options::default()
+        };
+        let mut tessellator = Tessellator::new(result.ir(), options);
+        for face in &result.ir().model.faces {
+            if let Ok(face_mesh) = tessellator.face(&face.id) {
+                for point in face_mesh.positions {
+                    vertices.push([point.x, point.y, point.z]);
+                }
+            }
+        }
+    }
+    if vertices.is_empty() {
+        bail!("{} has no tessellation vertices", path.display());
+    }
+    Ok(vertices)
+}
+
+fn gear_report(path: &Path) -> anyhow::Result<()> {
+    let vertices = load_vertices(path)?;
+    let report = analyze_gear(&vertices).context("no periodic gear profile found")?;
+    let value = json!({
+        "path": path.display().to_string(),
+        "vertices": vertices.len(),
+        "axis": report.axis,
+        "center": report.center,
+        "teeth": report.teeth,
+        "tip_radius": report.tip_radius,
+        "root_radius": report.root_radius,
+        "face_width": report.face_width,
+        "face_min": report.face_min,
+        "face_max": report.face_max,
+        "tooth_ratio": report.tooth_ratio,
+        "periodicity": report.periodicity,
+    });
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+struct GearReport {
+    axis: [f64; 3],
+    center: [f64; 3],
+    teeth: usize,
+    tip_radius: f64,
+    root_radius: f64,
+    face_width: f64,
+    face_min: f64,
+    face_max: f64,
+    tooth_ratio: f64,
+    periodicity: f64,
+}
+
+fn folded_tooth_count(profile: &[f64; 720], root_radius: f64) -> Option<(usize, f64)> {
+    const SLOTS: usize = 24;
+    let mut candidates = Vec::new();
+    for teeth in 6..=40usize {
+        let pitch = 720.0 / teeth as f64;
+        let mut sums = [0.0_f64; SLOTS];
+        let mut counts = [0usize; SLOTS];
+        for (index, profile_value) in profile.iter().enumerate() {
+            let value = if *profile_value > 0.0 {
+                *profile_value
+            } else {
+                root_radius
+            };
+            let phase = (index as f64 / pitch).fract();
+            let slot = ((phase * SLOTS as f64) as usize).min(SLOTS - 1);
+            sums[slot] += value;
+            counts[slot] += 1;
+        }
+        let mut minimum = f64::INFINITY;
+        let mut maximum = f64::NEG_INFINITY;
+        for (sum, count) in sums.iter().zip(counts) {
+            if count == 0 {
+                continue;
+            }
+            let average = sum / count as f64;
+            minimum = minimum.min(average);
+            maximum = maximum.max(average);
+        }
+        candidates.push((teeth, maximum - minimum));
+    }
+    let maximum = candidates
+        .iter()
+        .map(|(_, contrast)| *contrast)
+        .fold(0.0_f64, f64::max);
+    let minimum = candidates
+        .iter()
+        .map(|(_, contrast)| *contrast)
+        .fold(f64::INFINITY, f64::min);
+    if maximum <= 0.25 * (profile.iter().fold(0.0_f64, |a, b| a.max(*b)) - root_radius) {
+        return None;
+    }
+    // Divisors of the tooth count produce the same contrast; the largest
+    // candidate near the maximum is the fundamental tooth count.
+    candidates
+        .into_iter()
+        .filter(|(_, contrast)| *contrast >= maximum - 0.02 * (maximum - minimum).max(1.0e-9))
+        .max_by_key(|(teeth, _)| *teeth)
+}
+
+fn analyze_gear(vertices: &[[f64; 3]]) -> Option<GearReport> {
+    const BINS: usize = 720;
+    let axes = [
+        ([0.0, 0.0, 1.0], 0usize, 1usize, 2usize),
+        ([0.0, 1.0, 0.0], 2usize, 0usize, 1usize),
+        ([1.0, 0.0, 0.0], 1usize, 2usize, 0usize),
+    ];
+    let mut best: Option<(f64, GearReport)> = None;
+    for (axis, u, v, w) in axes {
+        let mut radial = Vec::new();
+        let mut max_radius = 0.0_f64;
+        for point in vertices {
+            let radius = point[u].hypot(point[v]);
+            radial.push((radius, point[w]));
+            max_radius = max_radius.max(radius);
+        }
+        if max_radius <= 0.0 {
+            continue;
+        }
+        let floor = 0.65 * max_radius;
+        let mut min_tooth = f64::INFINITY;
+        for &(radius, _) in &radial {
+            if radius > floor {
+                min_tooth = min_tooth.min(radius);
+            }
+        }
+        let root_radius = dominant_radius(radial.iter().map(|(radius, _)| *radius), max_radius)
+            .unwrap_or(min_tooth);
+        if !root_radius.is_finite() || max_radius / root_radius < 1.08 {
+            continue;
+        }
+        let threshold = 0.5 * (root_radius + max_radius);
+        let mut profile = [0.0_f64; BINS];
+        for point in vertices {
+            let du = point[u];
+            let dv = point[v];
+            let radius = du.hypot(dv);
+            if radius <= threshold {
+                continue;
+            }
+            let angle = dv.atan2(du).rem_euclid(std::f64::consts::TAU);
+            let bin = ((angle / std::f64::consts::TAU) * BINS as f64) as usize % BINS;
+            if radius > profile[bin] {
+                profile[bin] = radius;
+            }
+        }
+        let mask: Vec<bool> = profile.iter().map(|value| *value > threshold).collect();
+        let mask_count = mask.iter().filter(|value| **value).count();
+        if mask_count < BINS / 8 {
+            continue;
+        }
+        let min_lag = BINS / 40;
+        let max_lag = BINS / 6;
+        let mut best_correlation = 0.0_f64;
+        for lag in min_lag..=max_lag {
+            let matches = (0..BINS)
+                .filter(|index| mask[*index] && mask[(index + lag) % BINS])
+                .count();
+            let correlation = matches as f64 / mask_count as f64;
+            best_correlation = best_correlation.max(correlation);
+        }
+        let Some((teeth, _)) = folded_tooth_count(&profile, root_radius) else {
+            continue;
+        };
+        let tooth_ratio = max_radius / root_radius;
+        if best_correlation < 0.8 || !(1.08..=1.65).contains(&tooth_ratio) {
+            continue;
+        }
+
+        let mut min_u = f64::INFINITY;
+        let mut max_u = f64::NEG_INFINITY;
+        let mut min_v = f64::INFINITY;
+        let mut max_v = f64::NEG_INFINITY;
+        let mut min_w = f64::INFINITY;
+        let mut max_w = f64::NEG_INFINITY;
+        for point in vertices {
+            let radius = point[u].hypot(point[v]);
+            if radius > 0.8 * max_radius {
+                min_u = min_u.min(point[u]);
+                max_u = max_u.max(point[u]);
+                min_v = min_v.min(point[v]);
+                max_v = max_v.max(point[v]);
+                min_w = min_w.min(point[w]);
+                max_w = max_w.max(point[w]);
+            }
+        }
+        let face_width = max_w - min_w;
+        if !face_width.is_finite() || face_width <= 0.0 {
+            continue;
+        }
+        let center = match axis {
+            [0.0, 0.0, 1.0] => [0.5 * (min_u + max_u), 0.5 * (min_v + max_v), 0.0],
+            [0.0, 1.0, 0.0] => [0.5 * (min_u + max_u), 0.0, 0.5 * (min_v + max_v)],
+            _ => [0.0, 0.5 * (min_u + max_u), 0.5 * (min_v + max_v)],
+        };
+        let face_ratio = face_width / (2.0 * max_radius);
+        let score = best_correlation + 0.25 * (tooth_ratio - 1.0) - 0.2 * face_ratio;
+        let report = GearReport {
+            axis,
+            center,
+            teeth,
+            tip_radius: max_radius,
+            root_radius,
+            face_width,
+            face_min: min_w,
+            face_max: max_w,
+            tooth_ratio,
+            periodicity: best_correlation,
+        };
+        if best.as_ref().is_none_or(|(current, _)| score > *current) {
+            best = Some((score, report));
+        }
+    }
+    best.map(|(_, report)| report)
+}
+
+fn gear_profile_report(path: &Path, bins: usize) -> anyhow::Result<()> {
+    let bins = bins.clamp(360, 4096);
+    let vertices = load_vertices(path)?;
+    let report = analyze_gear(&vertices).context("no periodic gear profile found")?;
+    let (u, v, w) = match report.axis {
+        [0.0, 0.0, 1.0] => (0usize, 1usize, 2usize),
+        [0.0, 1.0, 0.0] => (2usize, 0usize, 1usize),
+        _ => (1usize, 2usize, 0usize),
+    };
+    // The tooth end faces carry the dense profile; the side flanks are not
+    // present in the B-rep tessellation of this NX10 corpus.
+    let station_a = report.face_min;
+    let station_b = report.face_max;
+    let station_mid = report.face_min + 0.5 * report.face_width;
+    let stations = [station_a, station_b];
+    let mut profiles = [vec![0.0_f64; bins], vec![0.0_f64; bins]];
+    let mut input = File::open(path)?;
+    let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
+    let options = Options {
+        chord: 0.5,
+        ..Options::default()
+    };
+    let mut tessellator = Tessellator::new(result.ir(), options);
+    for face in &result.ir().model.faces {
+        let Ok(face_mesh) = tessellator.face(&face.id) else {
+            continue;
+        };
+        for triangle in &face_mesh.triangles {
+            let points = [
+                face_mesh.positions[triangle[0]],
+                face_mesh.positions[triangle[1]],
+                face_mesh.positions[triangle[2]],
+            ];
+            for (profile, station) in profiles.iter_mut().zip(stations) {
+                section_triangle_into_profile(profile, &points, w, station, u, v, bins, &report);
+            }
+        }
+    }
+    for profile in &mut profiles {
+        for value in profile {
+            if *value <= 0.0 {
+                *value = report.root_radius;
+            }
+        }
+    }
+    let mut radii_a = profiles[0].clone();
+    let mut radii_b = profiles[1].clone();
+    let profile_root = dominant_radius(radii_a.iter().chain(&radii_b).copied(), report.tip_radius)
+        .unwrap_or(report.root_radius);
+    fill_profile_gaps(&mut radii_a, profile_root);
+    fill_profile_gaps(&mut radii_b, profile_root);
+    let valid_a = radii_a.iter().fold(0.0_f64, |a, b| a.max(*b)) > 0.95 * report.tip_radius;
+    let valid_b = radii_b.iter().fold(0.0_f64, |a, b| a.max(*b)) > 0.95 * report.tip_radius;
+    let radii_mid: Vec<f64> = match (valid_a, valid_b) {
+        (true, true) => radii_a
+            .iter()
+            .zip(&radii_b)
+            .map(|(a, b)| 0.5 * (a + b))
+            .collect(),
+        (true, false) => radii_a.clone(),
+        (false, true) => radii_b.clone(),
+        (false, false) => vec![report.root_radius; bins],
+    };
+    let shift = if valid_a && valid_b {
+        profile_shift(&radii_a, &radii_b, report.root_radius)
+    } else {
+        0
+    };
+    let pitch_radius = 0.5 * (report.tip_radius + report.root_radius);
+    let helix_angle = if valid_a && valid_b && report.face_width > 0.0 {
+        let arc = (shift as f64 / bins as f64) * std::f64::consts::TAU * pitch_radius;
+        arc.atan2(report.face_width).to_degrees()
+    } else {
+        0.0
+    };
+    let value = json!({
+        "path": path.display().to_string(),
+        "bins": bins,
+        "axis": report.axis,
+        "center": report.center,
+        "teeth": report.teeth,
+        "tip_radius": report.tip_radius,
+        "root_radius": profile_root,
+        "face_min": report.face_min,
+        "face_max": report.face_max,
+        "face_width": report.face_width,
+        "station_a": station_a,
+        "station_b": station_b,
+        "station_mid": station_mid,
+        "valid_a": valid_a,
+        "valid_b": valid_b,
+        "radii_a": radii_a,
+        "radii_b": radii_b,
+        "radii_mid": radii_mid,
+        "helix_shift_bins": shift,
+        "helix_angle_deg": helix_angle,
+    });
+    println!("{}", serde_json::to_string(&value)?);
+    Ok(())
+}
+
+fn section_triangle_into_profile(
+    profile: &mut [f64],
+    points: &[Point3; 3],
+    w: usize,
+    station: f64,
+    u: usize,
+    v: usize,
+    bins: usize,
+    report: &GearReport,
+) {
+    let distances = points.map(|point| match w {
+        0 => point.x - station,
+        1 => point.y - station,
+        _ => point.z - station,
+    });
+    let mut intersections = Vec::new();
+    for index in 0..3 {
+        if distances[index].abs() <= 1.0e-9 {
+            intersections.push(points[index]);
+        }
+    }
+    for (first, second) in [(0usize, 1usize), (1, 2), (2, 0)] {
+        if (distances[first] < -1.0e-9 && distances[second] > 1.0e-9)
+            || (distances[first] > 1.0e-9 && distances[second] < -1.0e-9)
+        {
+            let t = distances[first] / (distances[first] - distances[second]);
+            intersections.push(Point3 {
+                x: points[first].x + t * (points[second].x - points[first].x),
+                y: points[first].y + t * (points[second].y - points[first].y),
+                z: points[first].z + t * (points[second].z - points[first].z),
+            });
+        }
+    }
+    for point in intersections {
+        let (du, dv) = match (u, v) {
+            (0, 1) => (point.x, point.y),
+            (1, 2) => (point.y, point.z),
+            _ => (point.z, point.x),
+        };
+        let radius = du.hypot(dv);
+        if radius < 0.5 * report.tip_radius {
+            continue;
+        }
+        let angle = dv.atan2(du).rem_euclid(std::f64::consts::TAU);
+        let bin = ((angle / std::f64::consts::TAU) * bins as f64) as usize % bins;
+        if radius > profile[bin] {
+            profile[bin] = radius;
+        }
+    }
+}
+
+fn dominant_radius(values: impl Iterator<Item = f64>, tip_radius: f64) -> Option<f64> {
+    let low = 0.6 * tip_radius;
+    let high = 0.75 * tip_radius;
+    let mut buckets: Vec<(i64, usize)> = Vec::new();
+    for value in values {
+        if !(low..=high).contains(&value) {
+            continue;
+        }
+        let key = (value * 1000.0).round() as i64;
+        if let Some((_, count)) = buckets.iter_mut().find(|(bucket, _)| *bucket == key) {
+            *count += 1;
+        } else {
+            buckets.push((key, 1));
+        }
+    }
+    buckets
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(key, _)| key as f64 / 1000.0)
+}
+
+fn fill_profile_gaps(profile: &mut [f64], root_radius: f64) {
+    const MAX_GAP: usize = 8;
+    let bins = profile.len();
+    let is_root = |value: f64| value <= root_radius * 1.02;
+    for index in 0..bins {
+        if !is_root(profile[index]) {
+            continue;
+        }
+        let left = (1..=MAX_GAP)
+            .map(|offset| (index + bins - offset) % bins)
+            .find(|other| !is_root(profile[*other]));
+        let right = (1..=MAX_GAP)
+            .map(|offset| (index + offset) % bins)
+            .find(|other| !is_root(profile[*other]));
+        let (Some(left), Some(right)) = (left, right) else {
+            continue;
+        };
+        let span = (right + bins - left) % bins;
+        if span == 0 || span > 2 * MAX_GAP {
+            continue;
+        }
+        let start = profile[left];
+        let end = profile[right];
+        for step in 1..span {
+            let other = (left + step) % bins;
+            let t = step as f64 / span as f64;
+            profile[other] = start + t * (end - start);
+        }
+    }
+}
+
+fn profile_shift(a: &[f64], b: &[f64], root_radius: f64) -> isize {
+    let bins = a.len().min(b.len());
+    if bins == 0 {
+        return 0;
+    }
+    let limit = (bins / 4) as isize;
+    let mut best_shift = 0_isize;
+    let mut best_score = f64::NEG_INFINITY;
+    for shift in -limit..=limit {
+        let mut score = 0.0;
+        for index in 0..bins {
+            let other = (index as isize + shift).rem_euclid(bins as isize) as usize;
+            score += (a[index] - root_radius) * (b[other] - root_radius);
+        }
+        if score > best_score {
+            best_score = score;
+            best_shift = shift;
+        }
+    }
+    best_shift
 }
 
 fn container_kind(path: &Path) -> &'static str {
@@ -370,6 +1118,13 @@ fn render_image(path: &Path, width: usize, height: usize) -> anyhow::Result<Vec<
             "{} has no renderable B-rep, JT, or CAM geometry",
             path.display()
         );
+    }
+    render_mesh_image(&mesh, width, height)
+}
+
+fn render_mesh_image(mesh: &MeshData, width: usize, height: usize) -> anyhow::Result<Vec<u32>> {
+    if mesh.indices.is_empty() && mesh.cam_points.is_empty() {
+        bail!("model has no renderable B-rep, JT, or CAM geometry");
     }
     let mut positions = mesh.positions.clone();
     positions.extend(mesh.cam_points.iter().copied());
@@ -636,7 +1391,7 @@ fn chord(default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
+pub(crate) fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
     println!("== {}", path.display());
     let mut input = File::open(path)?;
     let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
@@ -1278,5 +2033,64 @@ mod interactive_tests {
         assert_eq!(camera.pitch, initial.pitch);
         assert_eq!(camera.distance, initial.distance);
         assert_eq!(camera.target, initial.target);
+    }
+}
+
+#[cfg(test)]
+mod gear_tests {
+    use super::analyze_gear;
+
+    fn gear_vertices(teeth: usize) -> Vec<[f64; 3]> {
+        let mut vertices = Vec::new();
+        let tip = 24.0;
+        let root = 17.25;
+        let pitch = std::f64::consts::TAU / teeth as f64;
+        let duty = 0.38;
+        for z in [18.0, 43.0] {
+            for index in 0..720 {
+                let angle = std::f64::consts::TAU * index as f64 / 720.0;
+                let phase = angle.rem_euclid(pitch) / pitch;
+                let radius = if phase < duty { tip } else { root };
+                vertices.push([radius * angle.cos(), radius * angle.sin(), z]);
+            }
+        }
+        vertices
+    }
+
+    #[test]
+    fn counts_synthetic_tooth_edges() {
+        let mut profile = [17.25; 720];
+        let pitch = 720.0 / 14.0;
+        for (index, value) in profile.iter_mut().enumerate() {
+            let phase = (index as f64 % pitch) / pitch;
+            if phase < 0.38 {
+                *value = 24.0;
+            }
+        }
+        let (teeth, contrast) = super::folded_tooth_count(&profile, 17.25).expect("folded count");
+        assert_eq!(teeth, 14);
+        assert!(contrast > 6.0);
+    }
+
+    #[test]
+    fn detects_a_spur_gear_profile() {
+        let report = analyze_gear(&gear_vertices(14)).expect("gear profile");
+        assert_eq!(report.teeth, 14);
+        assert!((report.tip_radius - 24.0).abs() < 1e-9);
+        assert!((report.root_radius - 17.25).abs() < 1e-9);
+        assert!((report.face_width - 25.0).abs() < 1e-9);
+        assert_eq!(report.axis, [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn refuses_a_smooth_cylinder() {
+        let mut vertices = Vec::new();
+        for z in [0.0, 20.0] {
+            for index in 0..720 {
+                let angle = std::f64::consts::TAU * index as f64 / 720.0;
+                vertices.push([20.0 * angle.cos(), 20.0 * angle.sin(), z]);
+            }
+        }
+        assert!(analyze_gear(&vertices).is_none());
     }
 }

@@ -22,8 +22,106 @@ use cadmpeg_ir::geometry::{
     pcurve::{PcurveGeometry, PcurveNurbs},
     ProceduralCurveDefinition,
 };
-use cadmpeg_ir::math::Point2;
+use cadmpeg_ir::math::{Point2, Point3};
 use std::collections::BTreeMap;
+
+#[test]
+fn chart_subspan_projects_interior_vertices_onto_one_run() {
+    let points = [
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(1.0, 0.0, 0.0),
+        Point3::new(2.0, 0.0, 0.0),
+        Point3::new(3.0, 0.0, 0.0),
+    ];
+    let parameters = [0.0, 1.0, 2.0, 3.0];
+    let fit = super::chart_subspan(
+        &points,
+        &parameters,
+        0.01,
+        Some([Point3::new(1.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0)]),
+        7,
+    )
+    .expect("interior sub-span");
+    assert!((fit.start_parameter - 1.0).abs() < 1e-12);
+    assert!((fit.end_parameter - 2.0).abs() < 1e-12);
+    assert!(fit.start_distance < 1e-12);
+    assert!(fit.end_distance < 1e-12);
+    assert_eq!(fit.chart_pos, 7);
+}
+
+#[test]
+fn chart_subspan_allows_a_reversed_span() {
+    let points = [
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(1.0, 0.0, 0.0),
+        Point3::new(2.0, 0.0, 0.0),
+        Point3::new(3.0, 0.0, 0.0),
+    ];
+    let parameters = [0.0, 1.0, 2.0, 3.0];
+    let fit = super::chart_subspan(
+        &points,
+        &parameters,
+        0.01,
+        Some([Point3::new(2.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)]),
+        9,
+    )
+    .expect("reversed sub-span");
+    assert!((fit.start_parameter - 2.0).abs() < 1e-12);
+    assert!((fit.end_parameter - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn chart_subspan_rejects_disjoint_in_tolerance_runs() {
+    let points = [
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(10.0, 0.0, 0.0),
+        Point3::new(10.0, 10.0, 0.0),
+        Point3::new(0.0, 10.0, 0.0),
+        Point3::new(0.0, 0.0, 0.0),
+    ];
+    let parameters = [0.0, 10.0, 20.0, 30.0, 40.0];
+    assert!(
+        super::chart_subspan(
+            &points,
+            &parameters,
+            0.1,
+            Some([Point3::new(0.0, 0.05, 0.0), Point3::new(5.0, 0.05, 0.0),]),
+            0,
+        )
+        .is_none(),
+        "a vertex near two separated chart segments is ambiguous"
+    );
+}
+
+#[test]
+fn chart_subspan_rejects_a_doubled_back_span() {
+    let points = [
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(2.0, 0.0, 0.0),
+        Point3::new(2.0, 0.0, 1.0),
+        Point3::new(0.0, 0.0, 1.0),
+        Point3::new(0.0, 0.0, 0.0),
+    ];
+    let parameters = [0.0, 2.0, 3.0, 5.0, 7.0];
+    assert!(
+        super::chart_subspan(
+            &points,
+            &parameters,
+            0.05,
+            Some([Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 0.0, 1.0),]),
+            0,
+        )
+        .is_none(),
+        "antiparallel end tangents are a fold, not a sub-span"
+    );
+}
+
+#[test]
+fn chart_subspan_requires_a_unique_edge_witness() {
+    let points = [Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)];
+    let parameters = [0.0, 1.0];
+    assert!(super::chart_subspan(&points, &parameters, 0.01, None, 0).is_none());
+}
 
 #[test]
 fn intersection_support_completion_requires_one_unique_incident_complement() {
@@ -165,6 +263,69 @@ fn intersection_construction_recovers_one_missing_term_from_unique_edge_endpoint
         scan.rejected,
         crate::intersection::RejectionCounts::default()
     );
+}
+
+#[test]
+fn intersection_construction_admits_an_interior_edge_subspan() {
+    let mut stream = charted_intersection_with_edge_endpoint_witnesses_stream();
+    let intersection = stream
+        .windows(4)
+        .position(|window| window == [0, 38, 0, 12])
+        .expect("intersection record");
+    for offset in [25, 27] {
+        put_ref(&mut stream, intersection + offset, 1);
+    }
+    for (marker, point) in [
+        ([0, 29, 0, 11], [0.002, 0.0, 0.0]),
+        ([0, 29, 0, 15], [0.008, 0.0, 0.0]),
+    ] {
+        let vertex = stream
+            .windows(4)
+            .position(|window| window == marker)
+            .expect("vertex point record");
+        put_vec3(&mut stream, vertex + 16, point);
+    }
+
+    let scan =
+        crate::intersection::scan(&stream, crate::intersection::ChartPointLayout::Xyz3).unwrap();
+    let [curve] = scan.curves.as_slice() else {
+        panic!("interior sub-span admitted");
+    };
+    let fit = curve.subspan.expect("sub-span fit recorded");
+    assert!(fit.start_parameter < fit.end_parameter);
+    assert!(fit.start_distance < 1e-12);
+    assert!(fit.end_distance < 1e-12);
+    assert_eq!(
+        scan.rejected,
+        crate::intersection::RejectionCounts::default()
+    );
+}
+
+#[test]
+fn intersection_construction_rejects_a_subspan_outside_the_chart() {
+    let mut stream = charted_intersection_with_edge_endpoint_witnesses_stream();
+    let intersection = stream
+        .windows(4)
+        .position(|window| window == [0, 38, 0, 12])
+        .expect("intersection record");
+    for offset in [25, 27] {
+        put_ref(&mut stream, intersection + offset, 1);
+    }
+    let first_point = stream
+        .windows(4)
+        .position(|window| window == [0, 29, 0, 11])
+        .expect("first vertex point record");
+    put_vec3(&mut stream, first_point + 16, [0.002, 0.0, 0.0]);
+    let second_point = stream
+        .windows(4)
+        .position(|window| window == [0, 29, 0, 15])
+        .expect("second vertex point record");
+    put_vec3(&mut stream, second_point + 16, [0.05, 0.0, 0.0]);
+
+    let scan =
+        crate::intersection::scan(&stream, crate::intersection::ChartPointLayout::Xyz3).unwrap();
+    assert!(scan.curves.is_empty());
+    assert_eq!(scan.rejected.missing_start_term, 1);
 }
 
 #[test]

@@ -1190,6 +1190,7 @@ fn jt_scene_binding_transfers_visible_triangles_in_document_units() {
             ignored_group_element,
             material_element,
         ],
+        range_lod_nodes: &[],
     };
     let tessellations = crate::test_support::with_decode_context(|ctx| {
         super::display_jt_tessellations(ctx, &inputs, &mut Vec::new())

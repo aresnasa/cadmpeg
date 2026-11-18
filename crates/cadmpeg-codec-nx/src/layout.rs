@@ -44,6 +44,8 @@ pub(crate) mod token {
     pub(crate) const BLEND_SURF: u8 = 56;
     /// `OFFSET_SURF` (`60`). Spec §4.1.
     pub(crate) const OFFSET_SURF: u8 = 60;
+    /// `SWEPT_SURF` (`67`). Spec §4.1.
+    pub(crate) const SWEPT_SURF: u8 = 67;
     /// `B_SURFACE` (`124`). Spec §4.1.
     pub(crate) const B_SURFACE: u8 = 124;
     /// `TRIMMED_CURVE` (`133`). Spec §4.1.
@@ -64,6 +66,18 @@ pub(crate) mod token {
 pub(crate) mod assembly_placement_prefix {
     /// Stated value of `magic` (`bytes[6]`). Spec §2.3.
     pub(crate) const MAGIC_VALUE: [u8; 6] = [0xff, 0x00, 0x45, 0x01, 0x04, 0x01];
+}
+
+/// Byte offsets for the `assembly_placement_prefix_legacy` record.
+///
+/// Spec §2.3. Record length 4 B.
+///
+/// ```text
+/// The matrix follows the prefix; NX 10 frames are two bytes shorter than NX 12 frames.
+/// ```
+pub(crate) mod assembly_placement_prefix_legacy {
+    /// Stated value of `magic` (`bytes[4]`). Spec §2.3.
+    pub(crate) const MAGIC_VALUE: [u8; 4] = [0x45, 0x01, 0x04, 0x01];
 }
 
 /// Byte offsets for the `splmsstr_header` record.

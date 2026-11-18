@@ -427,6 +427,7 @@ fn attach_records(
             transforms: &model.display_jt.geometric_transform_attributes,
             materials: &model.display_jt.material_attributes,
             compressed_elements: model.display_jt.graph.compressed_elements(),
+            range_lod_nodes: &model.display_jt.range_lod_nodes,
         },
         losses,
     )?;

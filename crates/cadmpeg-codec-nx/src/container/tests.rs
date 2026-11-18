@@ -39,6 +39,30 @@ fn ug_part_segment_index_uses_row_one_self_boundary() {
 }
 
 #[test]
+fn container_admits_embedded_ole_marker_names() {
+    // NX stores embedded compound-storage substreams with an OLE marker byte
+    // before the final component (0x01 storage, 0x05 stream). The directory
+    // still has to parse, and the exact name must be retained.
+    let file = prt_with_named_payloads(&[
+        ("/Root/UG_PART/UG_PART", vec![1, 2, 3, 4]),
+        ("/Root/Spreadsheets/PART_FAMILY_SHEET/\u{1}Ole", Vec::new()),
+        (
+            "/Root/Spreadsheets/PART_FAMILY_SHEET/\u{5}SummaryInformation",
+            vec![9; 8],
+        ),
+    ]);
+    let container = container::scan_bytes(file).expect("directory with OLE markers");
+    let names: Vec<&str> = container
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert!(names.contains(&"/Root/Spreadsheets/PART_FAMILY_SHEET/\u{1}Ole"));
+    assert!(names.contains(&"/Root/Spreadsheets/PART_FAMILY_SHEET/\u{5}SummaryInformation"));
+    assert_eq!(container.entry_count(Region::Footer), 0);
+}
+
+#[test]
 fn container_parses_header_and_directory() {
     let c = container::scan_bytes(single_part_prt()).unwrap();
     assert_eq!(c.layout.version(), 0x06);
@@ -58,6 +82,26 @@ fn container_parses_header_and_directory() {
         .entries
         .iter()
         .any(|e| e.name == "/Root/UG_PART/UG_PART" && e.file_span().is_some()));
+}
+
+#[test]
+fn legacy_scan_admits_tagged_ugii_prefix() {
+    // Older writers reverse the marker bytes and terminate `UGII  ` with NUL,
+    // which puts the version byte one byte later.
+    let file = crate::test_support::test_cfb::legacy_cfb_with_tagged_ug_part();
+    crate::test_support::with_decode_context_over(
+        &file,
+        |_| {},
+        |ctx| {
+            let (container, _) =
+                container::scan_legacy(ctx, cadmpeg_core::decode::View::over_retained(&file))
+                    .expect("tagged UGII prefix");
+            let ContainerLayout::LegacyCfb { version } = container.layout else {
+                panic!("legacy fixture must select the legacy layout");
+            };
+            assert_eq!(version, 0x32);
+        },
+    );
 }
 
 #[test]

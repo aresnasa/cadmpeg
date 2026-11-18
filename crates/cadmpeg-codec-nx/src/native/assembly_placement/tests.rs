@@ -11,6 +11,24 @@ fn frame() -> Vec<u8> {
     bytes
 }
 
+fn legacy_frame() -> Vec<u8> {
+    let mut bytes = LEGACY_MAGIC_VALUE.to_vec();
+    bytes.extend_from_slice(&frame()[MAGIC_VALUE.len()..]);
+    bytes
+}
+
+fn frame_with_identity(prefix: &[u8], identity: &str) -> Vec<u8> {
+    let mut bytes = prefix.to_vec();
+    bytes.extend([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]);
+    bytes.extend([0, 0, 0, 1, 63, 0xf0, 0, 0, 0]);
+    bytes.extend(b"\x03\x03A\0");
+    bytes.push(3);
+    bytes.push(u8::try_from(identity.len() + 2).unwrap());
+    bytes.extend_from_slice(identity.as_bytes());
+    bytes.push(0);
+    bytes
+}
+
 #[test]
 fn placement_atoms_use_truncated_binary64_and_preserve_signed_zero() {
     for (raw, value) in [
@@ -52,6 +70,27 @@ fn placement_frame_requires_complete_text_terminators_and_proper_rotation() {
     let mut malformed = bytes;
     *malformed.last_mut().unwrap() = 1;
     assert!(parse_frame(View::over_retained(&malformed)).is_none());
+}
+
+#[test]
+fn placement_accepts_nx10_legacy_prefix_with_the_same_matrix() {
+    let modern = frame();
+    let legacy = legacy_frame();
+    assert_eq!(legacy.len() + 2, modern.len());
+    let parsed = parse_frame(View::over_retained(&legacy)).unwrap();
+    let reference = parse_frame(View::over_retained(&modern)).unwrap();
+    assert_eq!(parsed.length, legacy.len());
+    assert_eq!(parsed.matrix, reference.matrix);
+    assert_eq!(parsed.label, reference.label);
+    assert_eq!(parsed.uuid, reference.uuid);
+}
+
+#[test]
+fn placement_accepts_opaque_nx10_identity_text() {
+    let identity = "laptop-fc1.GenuineInt.1558328259.0.18420.8";
+    let bytes = frame_with_identity(&LEGACY_MAGIC_VALUE, identity);
+    let parsed = parse_frame(View::over_retained(&bytes)).unwrap();
+    assert_eq!(parsed.uuid, identity);
 }
 
 #[test]

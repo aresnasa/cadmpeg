@@ -138,3 +138,29 @@ fn display_jt_element_sequence_reads_one_framed_element() {
         1
     );
 }
+
+#[test]
+fn jt9_high_degree_lane_is_a_plain_i32_array() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    for value in [-1i32, -1, 1] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    assert_eq!(
+        super::super::frame_jt9_high_degree_lane_packet(&bytes),
+        Some((3, 16))
+    );
+    // An empty lane is the same four bytes as an empty CDP2 packet.
+    assert_eq!(
+        super::super::frame_jt9_high_degree_lane_packet(&0u32.to_le_bytes()),
+        Some((0, 4))
+    );
+    assert_eq!(
+        super::super::frame_jt9_high_degree_lane_packet(&bytes[..15]),
+        None
+    );
+    assert_eq!(
+        super::super::frame_jt9_high_degree_lane_packet(&u32::MAX.to_le_bytes()),
+        None
+    );
+}

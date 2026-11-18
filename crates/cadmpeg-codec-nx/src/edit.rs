@@ -190,6 +190,62 @@ pub fn set_part_attribute(
     })
 }
 
+/// Replace one CFB stream with exact bytes, copying every other stream and
+/// storage verbatim.
+///
+/// This is the byte-preserving primitive behind the higher-level edits. It
+/// refuses SPLMSSTR containers, which have their own repack path, and verifies
+/// the replacement reads back exactly before reporting success.
+pub fn replace_cfb_stream(
+    input: &Path,
+    output: &Path,
+    stream: &str,
+    payload: &[u8],
+) -> Result<EditReport, EditError> {
+    let source_bytes = fs::read(input)?;
+    let source_sha256 = sha256_hex(&source_bytes);
+    if source_bytes.len() < 8 || source_bytes[..8] != CFB_MAGIC {
+        return Err(EditError::UnsupportedContainer(
+            "stream replacement is implemented for legacy CFB parts".to_string(),
+        ));
+    }
+    if input == output {
+        return Err(EditError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "input and output must be different paths",
+        )));
+    }
+
+    let mut compound = cfb::open(input)?;
+    let _existing = read_stream(&mut compound, stream)?;
+
+    let temp = temporary_path(output);
+    if let Err(error) = copy_cfb_with_replacement(&mut compound, &temp, stream, payload) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    replace_file(&temp, output)?;
+
+    let mut written = cfb::open(output)?;
+    let written_payload = read_stream(&mut written, stream)?;
+    if written_payload != payload {
+        return Err(EditError::MalformedContainer(
+            "replaced stream did not read back byte-exactly".to_string(),
+        ));
+    }
+
+    let output_bytes = fs::read(output)?;
+    let output_sha256 = sha256_hex(&output_bytes);
+    Ok(EditReport {
+        source: input.to_path_buf(),
+        output: output.to_path_buf(),
+        changed_streams: vec![stream.to_string()],
+        source_sha256,
+        output_sha256,
+        byte_identical: false,
+    })
+}
+
 fn set_splmsstr_attribute(
     input: &Path,
     output: &Path,
@@ -300,7 +356,6 @@ fn set_splmsstr_attribute(
 #[derive(Debug, Clone, Copy)]
 struct SplmsstrField {
     offset_position: usize,
-    size_position: usize,
     offset: u64,
     size: u64,
 }
@@ -314,13 +369,44 @@ fn repack_splmsstr_growth(
     old_length: usize,
     new_payload: &[u8],
 ) -> Result<Vec<u8>, EditError> {
+    if new_payload.len() <= old_length {
+        return Err(EditError::MalformedContainer(
+            "growth repack received a shorter payload".into(),
+        ));
+    }
+    repack_splmsstr_payload(source, offset, old_length, new_payload)
+}
+
+/// Replace one file payload in a SPLMSSTR container and shift every later
+/// payload. Header and footer directory rows keep their absolute payload
+/// offsets, so both regions are rewritten when the replacement changes the
+/// file length. The fixed header and footer XXH32 checksums are recomputed.
+pub(crate) fn repack_splmsstr_payload(
+    source: &[u8],
+    offset: usize,
+    old_length: usize,
+    new_payload: &[u8],
+) -> Result<Vec<u8>, EditError> {
     let insertion = offset
         .checked_add(old_length)
         .filter(|end| *end <= source.len())
-        .ok_or_else(|| EditError::MalformedContainer("part/attrs span exceeds file".into()))?;
-    let delta = new_payload.len().checked_sub(old_length).ok_or_else(|| {
-        EditError::MalformedContainer("growth repack received a shorter payload".into())
-    })?;
+        .ok_or_else(|| EditError::MalformedContainer("payload span exceeds file".into()))?;
+    let insertion_u64 = u64::try_from(insertion)
+        .map_err(|_| EditError::MalformedContainer("payload offset exceeds u64".into()))?;
+    let offset_u64 = u64::try_from(offset)
+        .map_err(|_| EditError::MalformedContainer("payload offset exceeds u64".into()))?;
+    let old_length_u64 = u64::try_from(old_length)
+        .map_err(|_| EditError::MalformedContainer("payload length exceeds u64".into()))?;
+    let new_length_u64 = u64::try_from(new_payload.len())
+        .map_err(|_| EditError::MalformedContainer("payload length exceeds u64".into()))?;
+    let delta = i64::try_from(new_payload.len())
+        .ok()
+        .and_then(|new| {
+            i64::try_from(old_length)
+                .ok()
+                .and_then(|old| new.checked_sub(old))
+        })
+        .ok_or_else(|| EditError::MalformedContainer("payload size overflow".into()))?;
 
     let footer_offset = read_u48(source, 0x11)
         .ok_or_else(|| EditError::MalformedContainer("missing SPLMSSTR footer offset".into()))?;
@@ -341,39 +427,55 @@ fn repack_splmsstr_growth(
         let count = read_u32(source, footer + 6)
             .ok_or_else(|| EditError::MalformedContainer("missing FOOTER entry count".into()))?;
         parse_splmsstr_fields(source, footer + 10, count, &mut fields)?;
-        Some((footer, footer_offset))
+        Some(footer)
     } else {
         None
     };
 
-    let mut output = Vec::with_capacity(source.len() + delta);
+    let output_len = i64::try_from(source.len())
+        .ok()
+        .and_then(|len| len.checked_add(delta))
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(|| EditError::MalformedContainer("output size overflow".into()))?;
+    let mut output = Vec::with_capacity(output_len);
     output.extend_from_slice(&source[..offset]);
     output.extend_from_slice(new_payload);
     output.extend_from_slice(&source[insertion..]);
 
     for field in fields {
-        let shifted = footer.is_some_and(|(footer, _)| field.offset_position >= footer);
-        let write_base = if shifted { delta } else { 0 };
-        let new_offset = if field.offset >= insertion as u64 {
-            field
-                .offset
-                .checked_add(delta as u64)
+        let write_base = if footer.is_some_and(|footer| field.offset_position >= footer) {
+            delta
+        } else {
+            0
+        };
+        let write_position = i64::try_from(field.offset_position)
+            .ok()
+            .and_then(|position| position.checked_add(write_base))
+            .and_then(|position| usize::try_from(position).ok())
+            .ok_or_else(|| EditError::MalformedContainer("directory offset overflow".into()))?;
+        let new_offset = if field.offset >= insertion_u64 {
+            i64::try_from(field.offset)
+                .ok()
+                .and_then(|value| value.checked_add(delta))
+                .and_then(|value| u64::try_from(value).ok())
                 .ok_or_else(|| EditError::MalformedContainer("offset overflow".into()))?
         } else {
             field.offset
         };
-        let new_size = if field.offset == offset as u64 && field.size == old_length as u64 {
-            new_payload.len() as u64
+        let new_size = if field.offset == offset_u64 && field.size == old_length_u64 {
+            new_length_u64
         } else {
             field.size
         };
-        write_u64(&mut output, field.offset_position + write_base, new_offset)?;
-        write_u64(&mut output, field.size_position + write_base, new_size)?;
+        write_u64(&mut output, write_position, new_offset)?;
+        write_u64(&mut output, write_position + 8, new_size)?;
     }
 
-    if let Some((_, footer_offset)) = footer {
-        let new_footer_offset = footer_offset
-            .checked_add(delta as u64)
+    if footer.is_some() {
+        let new_footer_offset = i64::try_from(footer_offset)
+            .ok()
+            .and_then(|value| value.checked_add(delta))
+            .and_then(|value| u64::try_from(value).ok())
             .ok_or_else(|| EditError::MalformedContainer("footer offset overflow".into()))?;
         write_u48(&mut output, 0x11, new_footer_offset)?;
         if source.len() >= 4 && read_u32(source, source.len() - 4).is_some_and(|value| value != 0) {
@@ -431,14 +533,12 @@ fn parse_splmsstr_fields(
         let offset = read_u64(bytes, position)
             .ok_or_else(|| EditError::MalformedContainer("missing payload offset".into()))?;
         position += 8;
-        let size_position = position;
         let size = read_u64(bytes, position)
             .ok_or_else(|| EditError::MalformedContainer("missing payload size".into()))?;
         position += 8;
         if size != 0 {
             fields.push(SplmsstrField {
                 offset_position,
-                size_position,
                 offset,
                 size,
             });
@@ -884,25 +984,28 @@ fn escape(value: &str) -> String {
     escaped
 }
 
-fn copy_cfb_with_replacement(
+pub(crate) fn copy_cfb_with_replacement(
     source: &mut cfb::CompoundFile<File>,
     output: &Path,
     replaced_stream: &str,
     replacement: &[u8],
 ) -> Result<(), EditError> {
-    let entries: Vec<(PathBuf, bool, u32)> = source
+    let entries: Vec<_> = source
         .walk()
         .map(|entry| {
             (
                 entry.path().to_path_buf(),
                 entry.is_stream(),
                 entry.state_bits(),
+                *entry.clsid(),
+                entry.created(),
+                entry.modified(),
             )
         })
         .collect();
     let file = File::create(output)?;
     let mut destination = cfb::CompoundFile::create(file)?;
-    for (path, is_stream, state_bits) in entries {
+    for (path, is_stream, state_bits, clsid, created, modified) in entries {
         let name = path.to_string_lossy().replace('\\', "/");
         if name == "/" || name.is_empty() {
             continue;
@@ -922,6 +1025,9 @@ fn copy_cfb_with_replacement(
             stream.write_all(&data)?;
         } else {
             destination.create_storage(&path)?;
+            destination.set_storage_clsid(&path, clsid)?;
+            destination.set_created_time(&path, created)?;
+            destination.set_modified_time(&path, modified)?;
         }
         destination.set_state_bits(&path, state_bits)?;
     }
@@ -929,7 +1035,7 @@ fn copy_cfb_with_replacement(
     Ok(())
 }
 
-fn temporary_path(output: &Path) -> PathBuf {
+pub(crate) fn temporary_path(output: &Path) -> PathBuf {
     let mut name = output
         .file_name()
         .map(|name| name.to_os_string())
@@ -938,7 +1044,7 @@ fn temporary_path(output: &Path) -> PathBuf {
     output.with_file_name(name)
 }
 
-fn replace_file(temp: &Path, output: &Path) -> Result<(), EditError> {
+pub(crate) fn replace_file(temp: &Path, output: &Path) -> Result<(), EditError> {
     if output.exists() {
         fs::remove_file(output)?;
     }
@@ -946,7 +1052,7 @@ fn replace_file(temp: &Path, output: &Path) -> Result<(), EditError> {
     Ok(())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut text = String::with_capacity(64);
     for byte in digest {
@@ -1124,4 +1230,60 @@ mod tests {
         let _ = fs::remove_file(edited);
         let _ = fs::remove_file(same);
     }
+}
+
+#[test]
+fn replaces_one_cfb_stream_and_preserves_other_streams() {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let directory = std::env::temp_dir();
+    let input = directory.join(format!("nxstream-test-{unique}.prt"));
+    let edited = directory.join(format!("nxstream-test-{unique}-edited.prt"));
+    let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<UgAttributes><Attribute owner="part" title="DB_PART_DESC" value="old" xsi:type="StringAttributeType"/></UgAttributes>"#;
+    let original = b"\r\x01UGII  original payload";
+    let replacement = b"\r\x01UGII  replacement payload";
+    {
+        let file = File::create(&input).unwrap();
+        let mut compound = cfb::CompoundFile::create(file).unwrap();
+        compound.create_storage("part").unwrap();
+        compound
+            .create_stream("part/attrs")
+            .unwrap()
+            .write_all(xml)
+            .unwrap();
+        compound.create_storage("UG_PART").unwrap();
+        compound
+            .create_stream("UG_PART/UG_PART")
+            .unwrap()
+            .write_all(original)
+            .unwrap();
+        compound.flush().unwrap();
+    }
+
+    let report = replace_cfb_stream(&input, &edited, "UG_PART/UG_PART", replacement).unwrap();
+    assert_eq!(report.changed_streams, vec!["UG_PART/UG_PART".to_string()]);
+    assert!(!report.byte_identical);
+
+    let mut compound = cfb::open(&edited).unwrap();
+    let mut stream = compound.open_stream("UG_PART/UG_PART").unwrap();
+    let mut written = Vec::new();
+    stream.read_to_end(&mut written).unwrap();
+    assert_eq!(written, replacement);
+    let mut attrs = compound.open_stream("part/attrs").unwrap();
+    let mut written_xml = Vec::new();
+    attrs.read_to_end(&mut written_xml).unwrap();
+    assert_eq!(written_xml, xml);
+
+    let missing = replace_cfb_stream(&input, &edited, "UG_PART/MISSING", replacement);
+    assert!(matches!(missing, Err(EditError::MissingStream(_))));
+
+    let _ = fs::remove_file(input);
+    let _ = fs::remove_file(edited);
 }

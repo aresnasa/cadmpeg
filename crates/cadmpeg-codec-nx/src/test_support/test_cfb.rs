@@ -90,6 +90,22 @@ pub(crate) fn legacy_cfb_with_ug_part() -> Vec<u8> {
     file
 }
 
+pub(crate) fn legacy_cfb_with_tagged_ug_part() -> Vec<u8> {
+    let mut file = legacy_cfb_with_ug_part();
+    let payload = sector_mut(&mut file, 1);
+    payload[..10].copy_from_slice(b"\x01\x0dUGII  \x00\x32");
+    let description = b": TRANSMIT FILE (partition) created by test";
+    let mut at = 10;
+    payload[at..at + 2].copy_from_slice(b"PS");
+    at += 2;
+    payload[at..at + 4].copy_from_slice(
+        &(u32::try_from(description.len()).expect("fixture value fits u32")).to_be_bytes(),
+    );
+    at += 4;
+    payload[at..at + description.len()].copy_from_slice(description);
+    file
+}
+
 pub(crate) fn legacy_cfb_with_partial_ug_part() -> Vec<u8> {
     const SECTOR: usize = 512;
     const END: u32 = 0xffff_fffe;

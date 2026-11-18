@@ -123,7 +123,7 @@ fn aggregate_admission_rejects_missing_owners_and_repeated_field_disagreement() 
         (
             "/display_jt_shape_lod_elements/0/segment",
             json!("nx:display-jt:segment#1"),
-            "type-7",
+            "shape LOD",
         ),
         (
             "/display_jt_compressed_elements/0/segment",

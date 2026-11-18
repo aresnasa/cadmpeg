@@ -47,6 +47,7 @@ record states which lane it is in.
 | `54` | TORUS | 107 B | logical fixed record length | §4.1 |
 | `56` | BLEND_SURF | variable | 66 bytes plus escape and large-index shifts | §4.1 |
 | `60` | OFFSET_SURF | 31 B | logical fixed record length | §4.1 |
+| `67` | SWEPT_SURF | 53 B | logical fixed record length; tail is profile XMT plus direction xyz and auxiliary f64 | §4.1 |
 | `124` | B_SURFACE | 23 B | logical fixed record length | §4.1 |
 | `133` | TRIMMED_CURVE | variable | 85 bytes plus escape and large-index shifts | §4.1 |
 | `134` | B_CURVE | 23 B | logical fixed record length | §4.1 |
@@ -135,6 +136,19 @@ Parsed by:
 | Offset | Size | Field | Type | Endian | Src | Meaning |
 | -----: | ---: | ----- | ---- | ------ | --- | ------- |
 | 0 | 6 | `magic` | `bytes[6]` | big | spec | `ff 00 45 01 04 01`. Twelve scalar atoms follow in row-major order as a · value `[255, 0, 69, 1, 4, 1]` |
+
+## `assembly_placement_prefix_legacy`
+
+Spec §2.3 · layout: byte offsets · size: 4 B
+
+The matrix follows the prefix; NX 10 frames are two bytes shorter than NX 12 frames.
+
+Parsed by:
+- `crates/cadmpeg-codec-nx/src/native/assembly_placement.rs`
+
+| Offset | Size | Field | Type | Endian | Src | Meaning |
+| -----: | ---: | ----- | ---- | ------ | --- | ------- |
+| 0 | 4 | `magic` | `bytes[4]` | big | spec | `45 01 04 01` · value `[69, 1, 4, 1]` |
 
 ## `splmsstr_header`
 

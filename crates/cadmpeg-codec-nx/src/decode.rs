@@ -210,6 +210,7 @@ struct Counts {
     spheres: usize,
     tori: usize,
     nurbs_surfaces: usize,
+    swept_surfaces: usize,
     offset_surfaces: usize,
     blend_surfaces: usize,
     lines: usize,
@@ -228,6 +229,7 @@ impl Counts {
             + self.spheres
             + self.tori
             + self.nurbs_surfaces
+            + self.swept_surfaces
             + self.offset_surfaces
             + self.blend_surfaces
     }

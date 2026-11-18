@@ -72,13 +72,24 @@ pub(crate) struct FaceFields {
     /// Next face in the owning shell, or the null reference.
     next_face: Option<XmtTarget>,
     /// First loop reference.
-    loop_xmt: Option<XmtTarget>,
+    pub(crate) loop_xmt: Option<XmtTarget>,
     /// Owning shell reference.
     pub(crate) shell: Option<XmtTarget>,
     /// Surface-carrier reference.
     pub(crate) surface: Option<XmtTarget>,
     /// Decoded orientation.
     pub(crate) sense: Sense,
+}
+
+/// Decoded fields of a `SWEPT_SURF` (type 67) record.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SweptSurfaceState {
+    /// Profile-curve XMT.
+    pub(crate) profile: u32,
+    /// Recorded sweep direction in source units.
+    pub(crate) direction: [f64; 3],
+    /// Fourth tail scalar; finite, not interpreted by the assembler.
+    pub(crate) auxiliary: f64,
 }
 
 /// Decoded fields needed from a sequentially framed EDGE record.
@@ -130,11 +141,11 @@ pub(crate) struct LoopFields {
     /// Attribute-list reference.
     pub(crate) attributes: Option<XmtTarget>,
     /// First fin in the loop.
-    fin: Option<XmtTarget>,
+    pub(crate) fin: Option<XmtTarget>,
     /// Owning face.
     pub(crate) face: Option<XmtTarget>,
     /// Next loop owned by the same face, or the null reference.
-    next_loop: Option<XmtTarget>,
+    pub(crate) next_loop: Option<XmtTarget>,
 }
 
 /// Sequentially decoded FIN references and sense.
@@ -441,6 +452,36 @@ impl Node {
         ))
     }
 
+    /// Decode a graph-owned `SWEPT_SURF` (type 67) record.
+    ///
+    /// The compact tail is the profile-curve XMT, the sweep direction, and one
+    /// auxiliary scalar. The auxiliary field is finite in every NX10 record
+    /// observed so far (it is a sentinel in most records); the direction must be
+    /// finite and non-zero.
+    pub(crate) fn swept_surface(&self) -> Option<SweptSurfaceState> {
+        (self.kind == NodeKind::SweptSurface).then_some(())?;
+        let mut at = self.common_header()?.1;
+        let profile = read_and_advance(&self.bytes, &mut at)?;
+        NonNullXmt::try_from(profile).ok()?;
+        let direction = [
+            View::f64_be_at(&self.bytes, at)?,
+            View::f64_be_at(&self.bytes, at + 8)?,
+            View::f64_be_at(&self.bytes, at + 16)?,
+        ];
+        let auxiliary = View::f64_be_at(&self.bytes, at + 24)?;
+        let norm_squared = direction.iter().map(|value| value * value).sum::<f64>();
+        (norm_squared.is_finite()
+            && norm_squared > 1.0e-24
+            && norm_squared < 1.0e24
+            && auxiliary.is_finite())
+        .then_some(())?;
+        Some(SweptSurfaceState {
+            profile,
+            direction,
+            auxiliary,
+        })
+    }
+
     /// Decode this graph-owned fixed analytic surface carrier.
     pub(crate) fn surface_geometry(&self) -> Option<cadmpeg_ir::geometry::SurfaceGeometry> {
         matches!(
@@ -465,6 +506,70 @@ impl Node {
         .then_some(())?;
         let payload_shift = self.common_header()?.1.checked_sub(19)?;
         crate::geometry::decode_curve_record(&self.bytes, self.kind, payload_shift)
+    }
+
+    /// All topology-record references carried by this node.
+    ///
+    /// Surface and curve carriers are excluded: they are decoded
+    /// independently and must not drive the topology repair pass. POINT is
+    /// included because VERTEX owns it.
+    fn topology_references(&self) -> Vec<(NodeKind, u32)> {
+        let mut references = Vec::new();
+        let mut push = |kind: NodeKind, target: Option<XmtTarget>| {
+            if let Some(target) = target {
+                let xmt = u32::from(target);
+                if xmt > 1 {
+                    references.push((kind, xmt));
+                }
+            }
+        };
+        match self.kind {
+            NodeKind::Shell => {
+                if let Some(fields) = self.shell_fields() {
+                    push(NodeKind::Body, fields.body);
+                    push(NodeKind::Shell, fields.next_shell);
+                    push(NodeKind::Face, fields.first_face);
+                    push(NodeKind::Region, fields.region);
+                    push(NodeKind::Face, fields.last_face);
+                }
+            }
+            NodeKind::Face => {
+                if let Some(fields) = self.face_fields() {
+                    push(NodeKind::Face, fields.next_face);
+                    push(NodeKind::Loop, fields.loop_xmt);
+                    push(NodeKind::Shell, fields.shell);
+                }
+            }
+            NodeKind::Loop => {
+                if let Some(fields) = self.loop_fields() {
+                    push(NodeKind::Fin, fields.fin);
+                    push(NodeKind::Face, fields.face);
+                    push(NodeKind::Loop, fields.next_loop);
+                }
+            }
+            NodeKind::Fin => {
+                if let Some(fields) = self.fin_fields() {
+                    push(NodeKind::Loop, fields.loop_xmt);
+                    push(NodeKind::Fin, fields.forward);
+                    push(NodeKind::Fin, fields.backward);
+                    push(NodeKind::Vertex, fields.vertex);
+                    push(NodeKind::Edge, fields.edge);
+                    push(NodeKind::Fin, fields.other);
+                }
+            }
+            NodeKind::Edge => {
+                if let Some(fields) = self.edge_fields() {
+                    push(NodeKind::Fin, fields.fin);
+                }
+            }
+            NodeKind::Vertex => {
+                if let Some(fields) = self.vertex_fields() {
+                    push(NodeKind::Point, fields.point);
+                }
+            }
+            _ => {}
+        }
+        references
     }
 
     fn reference_targets(&self) -> Vec<(ReferenceRole, u32)> {
@@ -547,7 +652,7 @@ impl Node {
 }
 
 /// An index of supported records keyed by `(node type, XMT identifier)`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Graph {
     nodes: BTreeMap<(NodeKind, u32), Node>,
     by_pos: BTreeMap<usize, (NodeKind, u32)>,
@@ -665,32 +770,97 @@ pub(crate) fn composite_curves(stream: &[u8]) -> Vec<CompositeCurve> {
 
 impl Graph {
     pub(crate) fn composite_curves(&self) -> Vec<CompositeCurve> {
-        (self.of_kind(NodeKind::Intersection).filter_map(|node| {
-            let mut at = 8 + node.shift;
-            let header = read_sequence_at::<5>(&node.bytes, &mut at)?;
-            let sense = match node.bytes.get(at) {
-                Some(b'+') => true,
-                Some(b'-') => false,
-                _ => return None,
-            };
-            at += 1;
-            let references: [u32; 6] = read_sequence_at::<6>(&node.bytes, &mut at)?;
-            let chart_with_optional_terms =
-                references[2] > 1 && references[3..=4].iter().all(|reference| *reference >= 1);
-            let null_witness = references[2..=4].iter().all(|reference| *reference == 1);
-            (references.iter().all(|reference| *reference != 0)
-                && (chart_with_optional_terms || null_witness)
-                && (references[0] > 1 || references[1] > 1))
-                .then_some(CompositeCurve {
-                    xmt: node.xmt(),
-                    header_references: header.map(XmtTarget::from_wire),
-                    sense,
-                    references: references.map(XmtTarget::from_wire),
-                    pos: node.pos(),
-                })
-        }))
-        .collect::<Vec<_>>()
+        self.of_kind(NodeKind::Intersection)
+            .filter_map(composite_curve_from_node)
+            .collect::<Vec<_>>()
     }
+
+    /// Type-38 constructions plus ambiguous candidates whose XMT is directly
+    /// named by exactly one edge.
+    ///
+    /// Some solved intersection records overlap a selected record's counted
+    /// payload, so fixed-record selection leaves them ambiguous and the graph
+    /// omits them. A B-rep edge that names the construction XMT is a positive
+    /// witness that the ambiguous candidate is a real curve record, not
+    /// payload. Header-chain-only names are deliberately not admitted: they
+    /// do not identify which construction produced the edge.
+    pub(crate) fn edge_referenced_composite_curves(&self, stream: &[u8]) -> Vec<CompositeCurve> {
+        let mut curves = self.composite_curves();
+        let mut seen = curves
+            .iter()
+            .map(|curve| curve.xmt)
+            .collect::<BTreeSet<_>>();
+        if self
+            .referenced_curve_xmts()
+            .iter()
+            .all(|xmt| seen.contains(xmt))
+        {
+            return curves;
+        }
+        let baseline = Self::select_fixed_records(stream, false);
+        let full = Self::select_fixed_records(stream, true);
+        for candidate in baseline.ambiguous.iter().chain(full.ambiguous.iter()) {
+            if candidate.kind != NodeKind::Intersection {
+                continue;
+            }
+            let xmt = candidate.xmt();
+            if seen.contains(&xmt) || self.unique_curve_edge_witness(xmt).is_none() {
+                continue;
+            }
+            let Some(node) = candidate.materialize(stream) else {
+                continue;
+            };
+            let Some(curve) = composite_curve_from_node(&node) else {
+                continue;
+            };
+            seen.insert(xmt);
+            curves.push(curve);
+        }
+        curves
+    }
+}
+
+fn composite_curve_from_node(node: &Node) -> Option<CompositeCurve> {
+    let frame_len = node.end.checked_sub(node.pos)?;
+    let mut at = 8 + node.shift;
+    let header = read_sequence_at::<5>(&node.bytes, &mut at)?;
+    let sense = match node.bytes.get(at) {
+        Some(b'+') => true,
+        Some(b'-') => false,
+        _ => return None,
+    };
+    at += 1;
+    // NX10 serializes the five-reference form (29 bytes). The sixth
+    // construction reference only exists in the six-reference form; reading
+    // it unconditionally consumes the next record's type tag.
+    let mut references_raw = [0u32; 6];
+    for reference in &mut references_raw[..5] {
+        *reference = read_and_advance(&node.bytes, &mut at)?;
+    }
+    if at < frame_len {
+        let mut sixth_end = at;
+        let sixth = read_and_advance(&node.bytes, &mut sixth_end)?;
+        if sixth_end == frame_len {
+            references_raw[5] = sixth;
+        }
+    }
+    let chart_with_optional_terms = references_raw[2] > 1
+        && references_raw[3..=4]
+            .iter()
+            .all(|reference| *reference >= 1);
+    let null_witness = references_raw[2..=4]
+        .iter()
+        .all(|reference| *reference == 1);
+    (references_raw[..5].iter().all(|reference| *reference != 0)
+        && (chart_with_optional_terms || null_witness)
+        && (references_raw[0] > 1 || references_raw[1] > 1))
+        .then_some(CompositeCurve {
+            xmt: node.xmt(),
+            header_references: header.map(XmtTarget::from_wire),
+            sense,
+            references: references_raw.map(XmtTarget::from_wire),
+            pos: node.pos(),
+        })
 }
 
 /// Decode compact first instances bound to their complete type-38 declaration.
@@ -875,7 +1045,8 @@ impl Graph {
         let baseline_records = Self::select_fixed_records(stream, false);
         let full_records = Self::select_fixed_records(stream, true);
         if full_records.matches_selection(&baseline_records) {
-            return baseline_records.materialize(stream);
+            let graph = baseline_records.materialize(stream);
+            return repair_if_incomplete(graph, stream, &baseline_records.ambiguous);
         }
         let mut baseline = baseline_records.materialize(stream);
         let full_domain = full_records.materialize(stream);
@@ -885,7 +1056,7 @@ impl Graph {
             })
         });
         if !preserves_baseline {
-            return baseline;
+            return repair_if_incomplete(baseline, stream, &baseline_records.ambiguous);
         }
         if !baseline.has_complete_body_topology()
             && full_domain.has_complete_body_topology()
@@ -894,8 +1065,81 @@ impl Graph {
             full_domain
         } else {
             baseline.admit_referenced_full_domain_nodes(&full_domain);
-            baseline
+            let mut ambiguous = baseline_records.ambiguous.clone();
+            ambiguous.extend(full_records.ambiguous.iter().copied());
+            repair_if_incomplete(baseline, stream, &ambiguous)
         }
+    }
+
+    fn repaired(&self, stream: &[u8], ambiguous: &[NodeCandidate]) -> Graph {
+        let mut graph = self.clone();
+        loop {
+            let mut referenced = BTreeSet::new();
+            for node in graph.nodes.values() {
+                referenced.extend(node.topology_references());
+            }
+            let missing = referenced
+                .into_iter()
+                .filter(|key| !graph.nodes.contains_key(key))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                break;
+            }
+            let mut added = false;
+            for key in missing {
+                let options = ambiguous
+                    .iter()
+                    .copied()
+                    .filter(|candidate| (candidate.kind, candidate.xmt()) == key)
+                    .collect::<Vec<_>>();
+                let best = if let [candidate] = options.as_slice() {
+                    Some(*candidate)
+                } else {
+                    let scored = options
+                        .iter()
+                        .copied()
+                        .map(|candidate| (graph.candidate_support(stream, candidate), candidate))
+                        .collect::<Vec<_>>();
+                    let unique_best = || {
+                        let max = scored.iter().map(|(score, _)| *score).max()?;
+                        let mut best = scored
+                            .iter()
+                            .filter(|(score, _)| *score == max)
+                            .map(|(_, candidate)| *candidate);
+                        let candidate = best.next()?;
+                        best.next().is_none().then_some(candidate)
+                    };
+                    unique_best()
+                };
+                let Some(best) = best else {
+                    continue;
+                };
+                let Some(node) = best.materialize(stream) else {
+                    continue;
+                };
+                if graph.nodes.contains_key(&key) {
+                    continue;
+                }
+                graph.by_pos.insert(node.pos(), key);
+                graph.nodes.insert(key, node);
+                added = true;
+            }
+            if !added {
+                break;
+            }
+            graph.index_kinds();
+        }
+        graph
+    }
+
+    fn candidate_support(&self, stream: &[u8], candidate: NodeCandidate) -> usize {
+        let Some(node) = candidate.materialize(stream) else {
+            return 0;
+        };
+        node.topology_references()
+            .iter()
+            .filter(|key| self.nodes.contains_key(key))
+            .count()
     }
 
     /// Admit full-domain nodes through unique typed XMT references.
@@ -1009,21 +1253,24 @@ impl Graph {
         // that is wholly contained in a selected record is payload data, not
         // a second serialized node. Counting it first can invalidate the real
         // node and make otherwise stable identities depend on unrelated bytes.
-        let non_overlapping = Self::select_non_overlapping_candidates(stream, candidates);
-        let selected = Self::select_unique_candidates(non_overlapping);
+        let (non_overlapping, mut ambiguous) =
+            Self::select_non_overlapping_candidates(stream, candidates);
+        let (selected, duplicate_ambiguous) = Self::select_unique_candidates(non_overlapping);
+        ambiguous.extend(duplicate_ambiguous);
         // BODY and REGION carry ownership identity only. Their opaque fixed
         // payloads can contain complete-looking typed tags, so they are
         // admitted after typed topology/carrier selection and never veto a
         // typed candidate. An ownership node that shares bytes with a typed
         // node is ambiguous and is omitted; shells retain the identity even
         // when the optional BODY or REGION record is absent.
-        let non_overlapping_ownership =
+        let (non_overlapping_ownership, _) =
             Self::select_non_overlapping_candidates(stream, ownership_candidates);
-        let ownership = Self::select_unique_candidates(non_overlapping_ownership);
+        let (ownership, _) = Self::select_unique_candidates(non_overlapping_ownership);
         let admitted_ownership = Self::admit_disjoint_ownership(ownership, &selected);
         FixedRecordSelection {
             typed: selected,
             ownership: admitted_ownership,
+            ambiguous,
         }
     }
 
@@ -1098,7 +1345,19 @@ impl Graph {
             .copied()
             .filter(|candidate| fixed_record_boundary(stream, candidate.end()));
         let Some(candidate) = boundary_candidates.next() else {
-            return [None; 2];
+            // Neither interpretation reaches a record boundary. Prefer the
+            // escaped form only when the direct reading produced an
+            // implausible XMT from the escape marker, which is the signature
+            // of a compact record that older writers escaped explicitly.
+            let direct_implausible =
+                candidates[0].is_some_and(|candidate| u32::from(candidate.xmt()) > 1_000_000);
+            let escaped_plausible =
+                candidates[1].is_some_and(|candidate| u32::from(candidate.xmt()) <= 1_000_000);
+            return if direct_implausible && escaped_plausible {
+                [candidates[1], None]
+            } else {
+                [None; 2]
+            };
         };
         if boundary_candidates.next().is_none() {
             [Some(candidate), None]
@@ -1111,43 +1370,46 @@ impl Graph {
     ///
     /// A second record with the same `(kind, xmt)` is not a recoverable choice:
     /// the fixed-record grammar provides no discriminator that can make one
-    /// authoritative. Invalidate the identity instead of ranking candidates
-    /// by topology shape, reference counts, or scan position.
-    fn select_unique_candidates(mut candidates: Vec<NodeCandidate>) -> Vec<NodeCandidate> {
-        let mut by_key = BTreeMap::<(NodeKind, u32), Option<NodeCandidate>>::new();
-        for &node in &candidates {
-            match by_key.entry((node.kind, node.xmt())) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(Some(node));
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    entry.insert(None);
-                }
+    /// authoritative. Return both the unambiguous selection and the ambiguous
+    /// candidates, which a later completeness-driven repair pass may resolve
+    /// through topology references.
+    fn select_unique_candidates(
+        candidates: Vec<NodeCandidate>,
+    ) -> (Vec<NodeCandidate>, Vec<NodeCandidate>) {
+        let mut by_key = BTreeMap::<(NodeKind, u32), Vec<NodeCandidate>>::new();
+        for node in candidates {
+            by_key
+                .entry((node.kind, node.xmt()))
+                .or_default()
+                .push(node);
+        }
+        let mut selected = Vec::new();
+        let mut ambiguous = Vec::new();
+        for group in by_key.into_values() {
+            if let [node] = group.as_slice() {
+                selected.push(*node);
+            } else {
+                ambiguous.extend(group);
             }
         }
-        // Reuse the admitted input storage. The tree already supplies key order
-        // and invalidates every ambiguous identity, including identical rows.
-        let mut selected = 0;
-        for candidate in by_key.into_values().flatten() {
-            candidates[selected] = candidate;
-            selected += 1;
-        }
-        candidates.truncate(selected);
-        candidates
+        (selected, ambiguous)
     }
 
-    /// Discard overlapping candidates when no serialized ownership boundary
-    /// identifies which record owns the bytes.
+    /// Separate non-overlapping candidates from the interpretations that
+    /// overlap a selected record. Overlapping candidates are not discarded
+    /// here: a later completeness-driven repair pass can admit one when a
+    /// selected topology record references it.
     fn select_non_overlapping_candidates(
         stream: &[u8],
         mut nodes: Vec<NodeCandidate>,
-    ) -> Vec<NodeCandidate> {
+    ) -> (Vec<NodeCandidate>, Vec<NodeCandidate>) {
         nodes.sort_by(|left, right| {
             left.pos()
                 .cmp(&right.pos())
                 .then_with(|| left.end().cmp(&right.end()))
         });
         let mut selected = Vec::new();
+        let mut ambiguous = Vec::new();
         let mut start = 0;
         while let Some(first) = nodes.get(start).copied() {
             if fixed_record_boundary(stream, first.end()) {
@@ -1158,6 +1420,7 @@ impl Graph {
                     .get(start)
                     .is_some_and(|candidate| candidate.pos() < end)
                 {
+                    ambiguous.push(nodes[start]);
                     start += 1;
                 }
                 continue;
@@ -1180,17 +1443,26 @@ impl Graph {
                     .copied()
                     .filter(|candidate| fixed_record_boundary(stream, candidate.end()))
                     .collect::<Vec<_>>();
-                for node in bounded.iter().copied().filter(|node| {
-                    bounded.iter().all(|other| {
-                        other == node || !(other.pos() < node.end() && node.pos() < other.end())
+                let keep = bounded
+                    .iter()
+                    .copied()
+                    .filter(|node| {
+                        bounded.iter().all(|other| {
+                            other == node || !(other.pos() < node.end() && node.pos() < other.end())
+                        })
                     })
-                }) {
-                    selected.push(node);
-                }
+                    .collect::<Vec<_>>();
+                ambiguous.extend(
+                    cluster
+                        .iter()
+                        .copied()
+                        .filter(|candidate| !keep.contains(candidate)),
+                );
+                selected.extend(keep);
             }
             start = end;
         }
-        selected
+        (selected, ambiguous)
     }
 
     /// Look up a node by record type and XMT identifier.
@@ -1484,7 +1756,6 @@ impl Graph {
             return false;
         };
         if fields.attributes.is_some()
-            || fields.next_shell.is_some()
             || fields.sentinel_0.is_some()
             || fields.sentinel_1.is_some()
             || fields.body.is_none_or(|target| u32::from(target) == 0)
@@ -1557,6 +1828,18 @@ impl Graph {
     }
 }
 
+fn repair_if_incomplete(graph: Graph, stream: &[u8], ambiguous: &[NodeCandidate]) -> Graph {
+    if graph.has_complete_body_topology() {
+        return graph;
+    }
+    let repaired = graph.repaired(stream, ambiguous);
+    if repaired.has_complete_body_topology() && repaired.body_shape_face_count() != 0 {
+        repaired
+    } else {
+        graph
+    }
+}
+
 impl ReferenceRole {
     fn for_kind(kind: NodeKind) -> Option<Self> {
         match kind {
@@ -1577,6 +1860,7 @@ impl ReferenceRole {
             | NodeKind::Torus
             | NodeKind::BlendSurface
             | NodeKind::OffsetSurface
+            | NodeKind::SweptSurface
             | NodeKind::BSurface => Some(Self::Surface),
             _ => None,
         }
@@ -1587,6 +1871,10 @@ impl ReferenceRole {
 struct FixedRecordSelection {
     typed: Vec<NodeCandidate>,
     ownership: Vec<NodeCandidate>,
+    /// Interpretations that overlap a selected record or repeat a selected
+    /// identity. A completeness-driven repair pass may admit one of them when
+    /// a selected topology record references its key.
+    ambiguous: Vec<NodeCandidate>,
 }
 
 impl FixedRecordSelection {
@@ -1610,9 +1898,9 @@ impl FixedRecordSelection {
         true
     }
 
-    fn materialize(self, stream: &[u8]) -> Graph {
+    fn materialize(&self, stream: &[u8]) -> Graph {
         let mut graph = Graph::default();
-        for candidate in self.typed.into_iter().chain(self.ownership) {
+        for candidate in self.typed.iter().chain(&self.ownership) {
             let Some(node) = candidate.materialize(stream) else {
                 continue;
             };
@@ -1690,6 +1978,7 @@ fn candidate_has_valid_family_framing(
             | NodeKind::Torus
             | NodeKind::BlendSurface
             | NodeKind::OffsetSurface
+            | NodeKind::SweptSurface
             | NodeKind::BSurface
             | NodeKind::TrimmedCurve
             | NodeKind::BCurve
@@ -1740,6 +2029,23 @@ fn candidate_has_valid_family_framing(
             point
                 .iter()
                 .all(|value| (*value * 1000.0).is_finite())
+                .then_some(())?;
+        }
+        NodeKind::SweptSurface => {
+            let mut at = 8 + shift;
+            skip_sequence_at(bytes, &mut at, 5)?;
+            matches!(bytes.get(at), Some(b'+' | b'-')).then_some(())?;
+            at += 1;
+            let profile = read_and_advance(bytes, &mut at)?;
+            NonNullXmt::try_from(profile).ok()?;
+            let direction = [
+                View::f64_be_at(bytes, at)?,
+                View::f64_be_at(bytes, at + 8)?,
+                View::f64_be_at(bytes, at + 16)?,
+            ];
+            View::f64_be_at(bytes, at + 24)?.is_finite().then_some(())?;
+            let norm_squared = direction.iter().map(|value| value * value).sum::<f64>();
+            (norm_squared.is_finite() && norm_squared > 1.0e-24 && norm_squared < 1.0e24)
                 .then_some(())?;
         }
         _ => {}

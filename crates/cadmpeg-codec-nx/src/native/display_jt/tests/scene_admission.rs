@@ -45,6 +45,7 @@ fn scene_node_paths_resolve_a_root_shape_node() {
         transforms: &[],
         materials: &[],
         compressed_elements: &[compressed],
+        range_lod_nodes: &[],
     };
 
     let elements = crate::native::display_jt::first_by_key(inputs.compressed_elements, |element| {
@@ -69,7 +70,7 @@ fn scene_node_paths_resolve_a_root_shape_node() {
 
 #[test]
 fn jt_node_path_refuses_nesting_without_erasing_resource_error() {
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     let base = crate::native::display_jt::DisplayJtBaseNodeData {
         id: "base".into(),
@@ -86,6 +87,7 @@ fn jt_node_path_refuses_nesting_without_erasing_resource_error() {
     let lookup = crate::native::display_jt::JtSceneGraph {
         by_object: BTreeMap::from([(7, &base)]),
         parents: BTreeMap::new(),
+        suppressed: HashSet::new(),
         instance_ids: BTreeMap::new(),
         transforms: HashMap::new(),
         materials: HashMap::new(),
@@ -120,7 +122,7 @@ fn jt_node_path_refuses_nesting_without_erasing_resource_error() {
 
 #[test]
 fn jt_node_path_skips_after_the_visit_bound() {
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     let base = crate::native::display_jt::DisplayJtBaseNodeData {
         id: "base".into(),
@@ -137,6 +139,7 @@ fn jt_node_path_skips_after_the_visit_bound() {
     let lookup = crate::native::display_jt::JtSceneGraph {
         by_object: BTreeMap::from([(7, &base)]),
         parents: BTreeMap::new(),
+        suppressed: HashSet::new(),
         instance_ids: BTreeMap::new(),
         transforms: HashMap::new(),
         materials: HashMap::new(),
@@ -345,6 +348,7 @@ fn tessellate_scene(
         transforms: &[],
         materials: &[],
         compressed_elements: std::slice::from_ref(&compressed),
+        range_lod_nodes: &[],
     };
     let mut losses = Vec::new();
     let tessellations = crate::test_support::with_decode_context(|ctx| {
@@ -419,4 +423,98 @@ fn keyed_inputs_keep_the_first_record_and_mark_repeats() {
     assert_eq!(unique.get("a"), Some(&None));
     assert_eq!(unique.get("b"), Some(&Some(&("b", 2))));
     assert_eq!(unique.get("c"), None);
+}
+
+#[test]
+fn range_lod_suppresses_every_alternate_after_the_finest_child() {
+    fn base(id: &str, object_id: u32) -> crate::native::display_jt::DisplayJtBaseNodeData {
+        crate::native::display_jt::DisplayJtBaseNodeData {
+            id: id.into(),
+            element: format!("element#{object_id}"),
+            object_type_id: [0; 16].into(),
+            object_id,
+            version: 1,
+            flags: 0,
+            attribute_object_ids: Vec::new(),
+            family_data_byte_len: 0,
+            family_data_sha256: "00".repeat(32).try_into().expect("valid digest"),
+            source_offset: 0,
+        }
+    }
+    fn element(object_id: u32) -> crate::native::display_jt::DisplayJtCompressedElement {
+        crate::native::display_jt::DisplayJtCompressedElement {
+            id: format!("element#{object_id}"),
+            segment: "scene".into(),
+            segment_type: 0,
+            ordinal: object_id,
+            object_type_id: [0; 16].into(),
+            object_base_type: 0,
+            object_id,
+            body_byte_len: 0,
+            body_sha256: cadmpeg_ir::hash::digest::Sha256Digest::digest(&[]),
+            inflated_offset: 0,
+            source_offset: 0,
+        }
+    }
+
+    let base_nodes = [base("base#1", 1), base("base#2", 2), base("base#3", 3)];
+    let group = crate::native::display_jt::DisplayJtGroupNodeData {
+        id: "group#1".into(),
+        base_node: "base#1".into(),
+        object_id: 1,
+        version: 1,
+        child_object_ids: vec![2, 3],
+        family_data_byte_len: 0,
+        family_data_sha256: "00".repeat(32).try_into().expect("valid digest"),
+        source_offset: 0,
+    };
+    let range = crate::native::display_jt::DisplayJtRangeLodNode {
+        id: "range#1".into(),
+        base_node: "base#1".into(),
+        object_id: 1,
+        group_version: 1,
+        child_object_ids: vec![2, 3],
+        lod_version: 1,
+        reserved_values: Vec::new(),
+        reserved_value: 0,
+        range_version: 1,
+        range_limits: crate::native::display_jt::JtRangeLimits::from_finite(vec![
+            crate::native::display_jt::FiniteBinary32::new(250.0).expect("finite range limit"),
+        ])
+        .expect("ordered range limits"),
+        center: [
+            crate::native::display_jt::FiniteBinary32::new(0.0).expect("finite centre"),
+            crate::native::display_jt::FiniteBinary32::new(0.0).expect("finite centre"),
+            crate::native::display_jt::FiniteBinary32::new(0.0).expect("finite centre"),
+        ],
+        source_offset: 0,
+    };
+    let compressed = [element(1), element(2), element(3)];
+    let inputs = crate::native::display_jt::DisplayJtTessellationInputs {
+        meshes: &[],
+        coordinates: &[],
+        normals: &[],
+        colors: &[],
+        texture_coordinates: &[],
+        vertex_flags: &[],
+        vertex_headers: &[],
+        coordinate_headers: &[],
+        shape_elements: &[],
+        bindings: &[],
+        shape_nodes: &[],
+        base_nodes: &base_nodes,
+        group_nodes: std::slice::from_ref(&group),
+        instance_nodes: &[],
+        transforms: &[],
+        materials: &[],
+        compressed_elements: &compressed,
+        range_lod_nodes: std::slice::from_ref(&range),
+    };
+    let elements = crate::native::display_jt::first_by_key(inputs.compressed_elements, |element| {
+        element.id.as_str()
+    });
+    let graph = crate::native::display_jt::JtSceneGraph::new("scene", &inputs, &elements)
+        .expect("scene node graph");
+    assert!(!graph.suppressed.contains(&2));
+    assert!(graph.suppressed.contains(&3));
 }

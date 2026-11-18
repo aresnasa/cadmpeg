@@ -145,8 +145,11 @@ impl DisplayJtGraph {
             let segment = segments
                 .get(element.segment.as_str())
                 .ok_or_else(|| invalid(&element.id, "segment does not resolve"))?;
-            if segment.segment_type != 7 {
-                return Err(invalid(&element.id, "segment is not a type-7 shape LOD"));
+            if !matches!(segment.segment_type, 6 | 7) {
+                return Err(invalid(
+                    &element.id,
+                    "segment is not a JT 8/9 tri-strip shape LOD",
+                ));
             }
         }
         for element in &wire.compressed_elements {

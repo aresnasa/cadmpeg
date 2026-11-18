@@ -2315,6 +2315,22 @@ fn parse_jt9_tri_strip_lod_header(body: &[u8]) -> Option<(u64, u16, u32, u16, &[
     ))
 }
 
+/// Frame a JT 9 high-degree face-attribute-mask lane. Unlike the topology
+/// packets that follow it, a lane is a plain little-endian `u32` value count
+/// followed by that many raw `i32` masks; it carries no CDP2 codec byte. An
+/// empty lane therefore occupies the same four bytes as an empty CDP2 packet,
+/// which is why lanes with no masks were previously indistinguishable from
+/// CDP2 and only nonzero lanes exposed the difference.
+fn frame_jt9_high_degree_lane_packet(bytes: &[u8]) -> Option<(u32, usize)> {
+    let count = usize::try_from(View::u32_le_at(bytes, 0)?).ok()?;
+    if count > crate::jt::MAX_ARITHMETIC_VALUES {
+        return None;
+    }
+    let byte_len = 4usize.checked_add(count.checked_mul(4)?)?;
+    bytes.get(..byte_len)?;
+    Some((u32::try_from(count).ok()?, byte_len))
+}
+
 /// The search frames packets past the last topology lane, where the bytes are
 /// not packets. A probe there that passes [`crate::jt::MAX_ARITHMETIC_WORK`]
 /// drops no lane, so its bound counts only when no lane count is found.
@@ -2365,7 +2381,7 @@ fn jt9_topology_high_degree_lane_search(
         let Some(bytes) = representation.get(cursor..) else {
             break;
         };
-        let Some((_, _, byte_len)) = crate::jt::frame_int32_cdp2(ctx, work_bound, bytes, 0)? else {
+        let Some((_, byte_len)) = frame_jt9_high_degree_lane_packet(bytes) else {
             break;
         };
         let Some(end) = cursor.checked_add(byte_len) else {
@@ -2413,14 +2429,14 @@ fn jt9_topology_high_degree_lane_search(
             };
             count
         };
-        if bindings == expected_vertex_bindings
+        let accepted = bindings == expected_vertex_bindings
             && quantization[0] <= 24
             && quantization[1] <= 13
             && quantization[2] <= 24
             && quantization[3] <= 24
             && i32::try_from(topological_vertex_count).is_ok()
-            && i32::try_from(vertex_attribute_count).is_ok()
-        {
+            && i32::try_from(vertex_attribute_count).is_ok();
+        if accepted {
             match_count += 1;
             matched_lane_count = lane_count;
         }
@@ -3320,7 +3336,13 @@ pub(super) fn display_jt_shape_lod_elements(
 ) -> Result<Vec<DisplayJtShapeLodElement>, CodecError> {
     const SEGMENT_TAIL: [u8; 6] = [1, 0, 0, 0, 0, 0];
     let mut elements = Vec::new();
-    for segment in segments.iter().filter(|segment| segment.segment_type == 7) {
+    // JT 8 shape-node segments (type 6) use the same element sequence, END
+    // marker and six-byte tail as JT 9 shape-LOD segments (type 7); both carry
+    // one tri-strip LOD object element per segment in this corpus.
+    for segment in segments
+        .iter()
+        .filter(|segment| matches!(segment.segment_type, 6 | 7))
+    {
         let Some(bytes) = container
             .bounded_entry_bytes(segment.source_offset, u64::from(segment.segment_byte_len))
         else {
@@ -3536,10 +3558,19 @@ pub(super) fn display_jt_topology_packet_sequences(
             let Some(remaining) = representation.get(cursor..) else {
                 return Ok(DisplayJtTopologyArrays::default());
             };
-            let Some((value_count, codec, byte_len)) =
-                crate::jt::frame_int32_cdp2(ctx, work_bound, remaining, 0)?
-            else {
-                return Ok(DisplayJtTopologyArrays::default());
+            let high_degree_lane =
+                matches!(role, TopologyPacketRole::HighDegreeFaceAttributeMasks(_));
+            let (value_count, codec, byte_len) = if high_degree_lane {
+                let Some((count, byte_len)) = frame_jt9_high_degree_lane_packet(remaining) else {
+                    return Ok(DisplayJtTopologyArrays::default());
+                };
+                (count, 0, byte_len)
+            } else {
+                let Some(packet) = crate::jt::frame_int32_cdp2(ctx, work_bound, remaining, 0)?
+                else {
+                    return Ok(DisplayJtTopologyArrays::default());
+                };
+                packet
             };
             let Some(packet_end) = cursor.checked_add(byte_len) else {
                 return Ok(DisplayJtTopologyArrays::default());
@@ -3552,17 +3583,34 @@ pub(super) fn display_jt_topology_packet_sequences(
             else {
                 return Ok(DisplayJtTopologyArrays::default());
             };
-            let values = match crate::jt::decode_int32_cdp2(ctx, work_bound, packet, 0)? {
-                Some((residuals, decoded_byte_len)) if decoded_byte_len == packet.len() => {
-                    let predictor = match role {
-                        TopologyPacketRole::VertexFlags | TopologyPacketRole::SplitFaceSymbols => {
-                            crate::jt::Predictor::Lag1
-                        }
-                        _ => crate::jt::Predictor::Null,
+            let values = if high_degree_lane {
+                let count = cadmpeg_core::decode::index_from_u32(value_count);
+                let mut raw = Vec::new();
+                for index in 0..count {
+                    let Some(offset) = index
+                        .checked_mul(4)
+                        .and_then(|value| 4usize.checked_add(value))
+                    else {
+                        return Ok(DisplayJtTopologyArrays::default());
                     };
-                    Some(crate::jt::unpack_predictor(&residuals, predictor))
+                    let Some(value) = View::i32_le_at(packet, offset) else {
+                        return Ok(DisplayJtTopologyArrays::default());
+                    };
+                    raw.push(value);
                 }
-                _ => None,
+                Some(raw)
+            } else {
+                match crate::jt::decode_int32_cdp2(ctx, work_bound, packet, 0)? {
+                    Some((residuals, decoded_byte_len)) if decoded_byte_len == packet.len() => {
+                        let predictor = match role {
+                            TopologyPacketRole::VertexFlags
+                            | TopologyPacketRole::SplitFaceSymbols => crate::jt::Predictor::Lag1,
+                            _ => crate::jt::Predictor::Null,
+                        };
+                        Some(crate::jt::unpack_predictor(&residuals, predictor))
+                    }
+                    _ => None,
+                }
             };
             packets.push(DisplayJtTopologyPacket {
                 role,
@@ -4520,7 +4568,7 @@ pub(super) fn display_jt_shape_lod_bindings(
                     let Some(target) = targets.next() else {
                         return Ok(Vec::new());
                     };
-                    if targets.next().is_some() || target.segment_type != 7 {
+                    if targets.next().is_some() || !matches!(target.segment_type, 6 | 7) {
                         return Ok(Vec::new());
                     }
                     ctx.charge_entities(1, "store DisplayJT shape LOD binding")?;
@@ -5208,6 +5256,7 @@ pub(super) struct DisplayJtTessellationInputs<'a> {
     pub(super) transforms: &'a [DisplayJtGeometricTransformAttribute],
     pub(super) materials: &'a [DisplayJtMaterialAttribute],
     pub(super) compressed_elements: &'a [DisplayJtCompressedElement],
+    pub(super) range_lod_nodes: &'a [DisplayJtRangeLodNode],
 }
 
 fn accumulate_display_jt_material(
@@ -5272,6 +5321,11 @@ fn multiply_jt_matrices(left: DisplayJtMatrix, right: DisplayJtMatrix) -> Option
 struct JtSceneGraph<'b> {
     by_object: BTreeMap<u32, &'b DisplayJtBaseNodeData>,
     parents: BTreeMap<u32, Vec<u32>>,
+    /// Non-finest range-LOD children and all their descendants. These carry
+    /// coarser alternates of geometry already reachable through the first
+    /// child, so emitting them would duplicate the same body at several
+    /// resolutions.
+    suppressed: HashSet<u32>,
     instance_ids: BTreeMap<u32, String>,
     /// Transform attributes by object id; `None` when the id repeats.
     transforms: HashMap<u32, Option<&'b DisplayJtGeometricTransformAttribute>>,
@@ -5350,6 +5404,7 @@ impl<'b> JtSceneGraph<'b> {
                 .push(std::slice::from_ref(&node.child_object_id));
         }
         let mut parents = BTreeMap::<u32, Vec<u32>>::new();
+        let mut children_by_object = BTreeMap::<u32, Vec<u32>>::new();
         for (object_id, base) in &by_object {
             let group = match group_children.get(base.id.as_str()).map(Vec::as_slice) {
                 None | Some([]) => None,
@@ -5364,16 +5419,51 @@ impl<'b> JtSceneGraph<'b> {
             if group.is_some() && instance.is_some() {
                 return None;
             }
-            for &child in group.or(instance).unwrap_or_default() {
+            let children = group.or(instance).unwrap_or_default();
+            for &child in children {
                 if !by_object.contains_key(&child) {
                     return None;
                 }
                 parents.entry(child).or_default().push(*object_id);
             }
+            if !children.is_empty() {
+                children_by_object.insert(*object_id, children.to_vec());
+            }
+        }
+        // A range-LOD node lists its alternates from the closest range to the
+        // farthest. Keep the first (finest) child so an offline decode emits
+        // one resolution of the body instead of stacking every alternate.
+        let mut suppressed = HashSet::new();
+        for node in unique_by_key(inputs.range_lod_nodes, |node| node.object_id)
+            .values()
+            .flatten()
+        {
+            // Object ids are scene-local; ignore a range-LOD node whose base
+            // node does not belong to this scene segment.
+            if !by_object
+                .values()
+                .any(|base| base.id.as_str() == node.base_node.as_str())
+            {
+                continue;
+            }
+            let Some(children) = children_by_object.get(&node.object_id) else {
+                continue;
+            };
+            for &child in children.iter().skip(1) {
+                let mut stack = vec![child];
+                while let Some(id) = stack.pop() {
+                    if suppressed.insert(id) {
+                        if let Some(nested) = children_by_object.get(&id) {
+                            stack.extend(nested.iter().copied());
+                        }
+                    }
+                }
+            }
         }
         Some(Self {
             by_object,
             parents,
+            suppressed,
             instance_ids,
             transforms,
             materials,
@@ -5673,6 +5763,12 @@ pub(super) fn display_jt_tessellations(
         let scene_graph = scene_graphs
             .entry(binding.scene_segment.as_str())
             .or_insert_with(|| JtSceneGraph::new(&binding.scene_segment, inputs, &elements));
+        if scene_graph
+            .as_ref()
+            .is_some_and(|graph| graph.suppressed.contains(&binding.shape_node_object_id))
+        {
+            continue;
+        }
         let visits = WorkBudget::new(MAX_JT_NODE_PATH_VISITS);
         let paths = match scene_graph.as_ref() {
             Some(scene_graph) => scene_graph.node_paths(ctx, shape_node.object_id, &visits)?,
@@ -5713,8 +5809,11 @@ pub(super) fn display_jt_tessellations(
             .then(|| normals.get(vertex_header.id.as_str()).copied())
             .flatten();
         if vertex_header.vertex_bindings & 0x8 != 0 && normal_array.is_none() {
-            dropped_display_jt_mesh(losses, mesh);
-            continue;
+            losses.push(NxLossCode::DisplayJtNormalsDropped.note(format!(
+                "Display-JT mesh {} declares vertex normals that were not decoded; \
+                 the mesh is kept without a normal lane.",
+                mesh.id
+            )));
         }
         let color_array = (vertex_header.vertex_bindings & 0x30 != 0)
             .then(|| colors.get(vertex_header.id.as_str()).copied())
