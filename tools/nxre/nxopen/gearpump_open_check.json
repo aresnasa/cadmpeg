@@ -1,0 +1,19 @@
+{
+  "assembly": "C:\\RE\\artifacts\\gearpump_open\\齿轮泵装配.prt",
+  "parts_root": "C:\\RE\\artifacts\\gearpump_open",
+  "expression_parts": [
+    "2.主动齿轮轴.prt",
+    "1.从动齿轮轴.prt"
+  ],
+  "expressions": [
+    "gear_module",
+    "gear_teeth_number",
+    "gear_face_width",
+    "gear_pressure_angle",
+    "gear_pitch_diameter",
+    "gear_tip_diameter",
+    "Gear_RootDiameter"
+  ],
+  "log_path": "C:\\RE\\artifacts\\nx_open_check.json",
+  "close_after_check": false
+}

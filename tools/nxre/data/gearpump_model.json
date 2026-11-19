@@ -1,0 +1,77 @@
+{
+  "name": "NX10 gear pump 齿轮泵UG10.0",
+  "gear": {
+    "teeth": 14,
+    "module_mm": 3.0,
+    "pressure_angle_deg": 20.0,
+    "face_width_mm": 25.0,
+    "pitch_radius_mm": 21.0,
+    "tip_radius_mm": 24.0,
+    "root_radius_mm": 17.25,
+    "center_distance_mm": 42.0
+  },
+  "oil": {
+    "name": "ISO VG 46",
+    "density_kg_m3": 870.0,
+    "specific_heat_j_kgk": 1900.0,
+    "viscosity_40c_pas": 0.04,
+    "viscosity_temperature_k": 3000.0,
+    "bulk_modulus_pa": 1500000000.0,
+    "vapour_pressure_bar": 0.02
+  },
+  "clearances": {
+    "tip_mm": 0.02,
+    "side_mm": 0.03,
+    "shaft_seal_mm": 0.01,
+    "thermal_expansion_gear_1_k": 1.15e-05,
+    "thermal_expansion_housing_1_k": 1e-05
+  },
+  "shaft": {
+    "diameter_mm": 18.0,
+    "bearing_span_mm": 80.0,
+    "material": "40Cr",
+    "youngs_modulus_pa": 206000000000.0,
+    "yield_mpa": 785.0,
+    "allowable_mpa": 300.0,
+    "density_kg_m3": 7850.0
+  },
+  "bearing": {
+    "designation": "6206",
+    "dynamic_load_n": 19500.0,
+    "static_load_n": 11200.0,
+    "count": 2
+  },
+  "housing": {
+    "material": "HT250",
+    "wall_thickness_mm": 10.0,
+    "bore_diameter_mm": 48.0,
+    "bolt_count": 8,
+    "bolt_diameter_mm": 8.0,
+    "bolt_allowable_mpa": 400.0,
+    "allowable_hoop_mpa": 80.0
+  },
+  "limits": {
+    "max_volumetric_efficiency_drop": 0.25,
+    "min_volumetric_efficiency": 0.7,
+    "min_bending_safety": 1.5,
+    "min_contact_safety": 1.2,
+    "min_shaft_safety": 2.0,
+    "min_bearing_life_h": 5000.0,
+    "min_housing_safety": 1.5,
+    "max_oil_rise_k": 45.0,
+    "min_npsh_margin_m": 1.0,
+    "max_pressure_ripple_pct": 8.0
+  },
+  "rated_pressure_bar": 100.0,
+  "peak_pressure_bar": 160.0,
+  "rated_speed_rpm": 1500.0,
+  "nominal_volumetric_efficiency": 0.92,
+  "provenance": {
+    "corpus": "C:\\RE\\artifacts\\齿轮泵UG10.0",
+    "driving_gear": "2.主动齿轮轴.prt",
+    "driven_gear": "1.从动齿轮轴.prt",
+    "housing": "10泵体.prt",
+    "method": "nxview gear measured 14 teeth, 24 mm tip radius, 25 mm face width on both shafts; nxview surfaces found the 17.25 mm root cylinder and the 42 mm housing bore spacing; module and pitch radius follow z=14 and r_a=24 mm.",
+    "limitations": "Reduced-order screening model. Pressure ripple, contact ratio, and mechanical losses use engineering correlations, not a transient CFD or flexible-body solve. Use the NX Open journal for NX Motion and NX CAE."
+  }
+}

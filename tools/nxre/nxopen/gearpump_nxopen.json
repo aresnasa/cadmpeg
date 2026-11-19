@@ -1,0 +1,38 @@
+{
+  "assembly": "C:\\RE\\artifacts\\gearpump_open\\齿轮泵装配.prt",
+  "component_root": "C:\\RE\\artifacts\\gearpump_open",
+  "relink": false,
+  "output_assembly": "C:\\RE\\artifacts\\gearpump_work\\齿轮泵装配_updated.prt",
+  "attributes": {
+    "10泵体.prt": {
+      "DB_PART_DESC": "GEAR PUMP BODY - RE BASELINE",
+      "DB_PART_NO": "GP-10"
+    },
+    "9泵盖.prt": {
+      "DB_PART_DESC": "GEAR PUMP COVER - RE BASELINE",
+      "DB_PART_NO": "GP-9"
+    },
+    "2.主动齿轮轴.prt": {
+      "DB_PART_DESC": "DRIVING GEAR SHAFT - Z14 M3",
+      "DB_PART_NO": "GP-2"
+    },
+    "1.从动齿轮轴.prt": {
+      "DB_PART_DESC": "DRIVEN GEAR SHAFT - Z14 M3",
+      "DB_PART_NO": "GP-1"
+    }
+  },
+  "expressions": {},
+  "motion": {
+    "scenario": "motion_1",
+    "solution": "Solution 1",
+    "driver_name": "J002.RMotion",
+    "driver_operation": "MotionEulerAngle1",
+    "case_speeds_rpm": [300, 800, 1500, 3000],
+    "export_csv": "C:\\RE\\artifacts\\gearpump_work\\motion_1.csv"
+  },
+  "cae": {
+    "sim_file": "",
+    "solution": "Solution 1"
+  },
+  "log_path": "C:\\RE\\artifacts\\gearpump_work\\nxopen_run.log"
+}
