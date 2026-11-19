@@ -28,6 +28,9 @@ python -m nxre sim-report motion_1.sim --out motion.json --markdown motion.md --
 # NX module marker/stream inventory for a .prt, .sim or .fem
 python -m nxre module-info part.prt --out modules.json --markdown modules.md
 
+# OM class inventory through the installed ug_inspect
+python -m nxre module-classes part.prt --out classes.json --markdown classes.md
+
 # NX10 Motion model and result files
 python -m nxre motion-info model.rmd --msg solver.msg
 python -m nxre motion-results --rplt result.rplt --rad animation.rad

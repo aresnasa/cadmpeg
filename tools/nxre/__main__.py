@@ -18,6 +18,7 @@ from .gear_pair import (
     write_report as write_pair_report,
 )
 from .motion import parse_msg, parse_rmd, write_motion_report
+from .module_classes import inspect_classes, write_markdown as write_class_markdown
 from .module_info import inspect_modules, write_markdown as write_module_markdown
 from .motion_minp import write_mres_csv
 from .motion_module import build_sim_report, write_markdown as write_sim_markdown
@@ -197,6 +198,27 @@ def _module_info(args: argparse.Namespace) -> int:
     print(
         "container={} streams={} modules={}".format(
             report["container"], len(report["streams"]), ",".join(present)
+        )
+    )
+    return 0
+
+
+def _module_classes(args: argparse.Namespace) -> int:
+    report = inspect_classes(args.file, args.uginspect)
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    if args.markdown:
+        write_class_markdown(report, args.markdown)
+    modules = ",".join(report["modules"])
+    print(
+        "release={} objects={} classes={} modules={}".format(
+            report.get("release"),
+            report.get("object_count"),
+            len(report.get("classes", [])),
+            modules,
         )
     )
     return 0
@@ -461,6 +483,16 @@ def main(argv: list[str] | None = None) -> int:
     module_info.add_argument("--out")
     module_info.add_argument("--markdown")
     module_info.set_defaults(function=_module_info)
+
+    module_classes = sub.add_parser(
+        "module-classes",
+        help="inventory NX module OM classes through ug_inspect -full",
+    )
+    module_classes.add_argument("file")
+    module_classes.add_argument("--uginspect")
+    module_classes.add_argument("--out")
+    module_classes.add_argument("--markdown")
+    module_classes.set_defaults(function=_module_classes)
 
     catalog = sub.add_parser(
         "catalog",
