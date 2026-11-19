@@ -1,8 +1,8 @@
 """Resolve the NX installation used by the reverse-engineering harnesses.
 
-NX 2606 at ``C:\\Program Files\\Siemens\\Designcenter2606`` is the current
-target. Older evidence was captured from NX 2412 at ``W:\\UGNX``; that install
-remains a fallback when the 2606 tree is absent.
+NX 2606 at ``C:\\Program Files\\Siemens\\Designcenter2606`` is the target.
+The path is resolved from the environment when set; there is no legacy-drive
+fallback.
 
 Overrides, highest priority first:
 
@@ -20,18 +20,15 @@ import os
 from pathlib import Path
 
 PRIMARY_ROOT = Path(r"C:\Program Files\Siemens\Designcenter2606")
-FALLBACK_ROOT = Path(r"W:\UGNX")
 
 
 def nx_install_root() -> Path:
-    """Return the NX installation root, preferring the 2606 install."""
+    """Return the NX installation root."""
     for variable in ("NX_INSTALL_ROOT", "UGII_BASE_DIR"):
         value = os.environ.get(variable)
         if value:
             return Path(value)
-    if (PRIMARY_ROOT / "NXBIN").is_dir():
-        return PRIMARY_ROOT
-    return FALLBACK_ROOT
+    return PRIMARY_ROOT
 
 
 def nxbin_dir() -> Path:
