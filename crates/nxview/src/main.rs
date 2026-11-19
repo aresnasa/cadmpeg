@@ -24,6 +24,9 @@ use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 mod assembly_mesh;
 mod cam;
+mod motion;
+mod motion_model;
+mod scene;
 
 #[derive(Default)]
 pub(crate) struct MeshData {
@@ -168,6 +171,138 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "viewer"))]
         "view" => {
             bail!("viewer not compiled: build with --features viewer")
+        }
+        "motion" => {
+            motion_command(&mut args)?;
+        }
+        "rad" => {
+            let path = PathBuf::from(args.next().context("usage: nxview rad <file.rad>")?);
+            let rad = motion::parse_rad(&path)?;
+            println!("frames={} tracks={}", rad.frame_count(), rad.tracks.len());
+            println!(
+                "times={:?}..{:?} ({})",
+                rad.times.first(),
+                rad.times.last(),
+                rad.times.len()
+            );
+            for (index, track) in rad.tracks.iter().enumerate() {
+                println!(
+                    "  track {index}: fixed={} axis_z={:?}",
+                    track.fixed,
+                    rad.axis_z(index)
+                );
+            }
+        }
+        "sim" | "open" => {
+            let mut path = None;
+            let mut root = None;
+            let mut info_only = false;
+            let mut bench = None;
+            let mut render = None;
+            let mut frame = None;
+            let mut only = None;
+            let mut hide = None;
+            let mut state_path = None;
+            let mut no_state = false;
+            while let Some(argument) = args.next() {
+                match argument.as_str() {
+                    "--root" => {
+                        root = Some(PathBuf::from(
+                            args.next().context("usage: --root <directory>")?,
+                        ));
+                    }
+                    "--info" => info_only = true,
+                    "--bench" => {
+                        bench = Some(
+                            args.next()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(10),
+                        );
+                    }
+                    "--render" => {
+                        render = Some(PathBuf::from(
+                            args.next().context("usage: --render <out.ppm>")?,
+                        ));
+                    }
+                    "--frame" => {
+                        frame = Some(
+                            args.next()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(0),
+                        );
+                    }
+                    "--only" => {
+                        only = Some(args.next().context("usage: --only <name fragment>")?);
+                    }
+                    "--hide" => {
+                        hide = Some(args.next().context("usage: --hide <name fragment>")?);
+                    }
+                    "--state" => {
+                        state_path = Some(PathBuf::from(
+                            args.next().context("usage: --state <file.json>")?,
+                        ));
+                    }
+                    "--no-state" => no_state = true,
+                    other => {
+                        if path.replace(PathBuf::from(other)).is_some() {
+                            bail!(
+                                "usage: nxview sim <file.sim|assembly.prt> [--root <dir>] [--info] [--bench N] [--render out.ppm] [--frame N]"
+                            );
+                        }
+                    }
+                }
+            }
+            let path = path.context(
+                "usage: nxview sim <file.sim|assembly.prt> [--root <dir>] [--info] [--bench N] [--render out.ppm] [--frame N]",
+            )?;
+            let mut scene = scene::load(&path, root.as_deref(), chord(0.5))?;
+            let state_path = if no_state {
+                None
+            } else {
+                Some(state_path.unwrap_or_else(|| scene::default_state_path(&path)))
+            };
+            let saved = state_path.as_deref().and_then(scene::load_state);
+            if let Some(saved) = &saved {
+                scene::apply_state(&mut scene, saved);
+            }
+            scene::print_summary(&scene);
+            if let Some(only) = &only {
+                for part in &mut scene.parts {
+                    part.visible = part.label.contains(only.as_str());
+                }
+            }
+            if let Some(hide) = &hide {
+                for part in &mut scene.parts {
+                    if part.label.contains(hide.as_str()) {
+                        part.visible = false;
+                    }
+                }
+            }
+            if let Some(frame) = frame {
+                scene.set_frame(frame);
+            }
+            if let Some(output) = render {
+                render_scene_ppm(&scene, &output, 1200, 780)?;
+                return Ok(());
+            }
+            let Some(frames) = bench else {
+                if info_only {
+                    return Ok(());
+                }
+                #[cfg(feature = "viewer")]
+                scene_view(
+                    &mut scene,
+                    state_path.clone(),
+                    saved.as_ref().and_then(|s| s.view),
+                )?;
+                #[cfg(not(feature = "viewer"))]
+                {
+                    let _ = &mut scene;
+                    bail!("viewer not compiled: build with --features viewer");
+                }
+                return Ok(());
+            };
+            bench_scene(&mut scene, frames)?;
         }
         "edit" => {
             let path = PathBuf::from(args.next().context("usage: nxview edit <part.prt>")?);
@@ -470,7 +605,7 @@ fn main() -> anyhow::Result<()> {
 fn assembly_command(args: &mut impl Iterator<Item = String>) -> anyhow::Result<()> {
     let action = args
         .next()
-        .context("usage: nxview assembly <info|export|relink|check|obj|render> ...")?;
+        .context("usage: nxview assembly <info|export|relink|check|obj|render|move|frames> ...")?;
     match action.as_str() {
         "info" => {
             let mut path = None;
@@ -606,6 +741,30 @@ fn assembly_command(args: &mut impl Iterator<Item = String>) -> anyhow::Result<(
                 manifest.components.len() - present
             );
         }
+        "move" => {
+            assembly_move(args)?;
+        }
+        "frames" => {
+            let path = PathBuf::from(
+                args.next()
+                    .context("usage: nxview assembly frames <assembly.prt>")?,
+            );
+            let frames = cadmpeg_codec_nx::read_placement_frames(&path)?;
+            println!("frames={}", frames.len());
+            for frame in frames {
+                println!(
+                    "  stream={} offset={:#x}+{} uuid={} label={:?} t=({:.4}, {:.4}, {:.4})",
+                    frame.stream,
+                    frame.frame_offset,
+                    frame.frame_length,
+                    frame.uuid,
+                    frame.label,
+                    frame.matrix[3],
+                    frame.matrix[7],
+                    frame.matrix[11]
+                );
+            }
+        }
         other => bail!("unknown assembly action: {other}"),
     }
     Ok(())
@@ -626,6 +785,384 @@ fn assembly_positionals(
         }
     }
     Ok((positionals, root))
+}
+
+/// Apply placement edits to an assembly copy.
+fn assembly_move(args: &mut impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let input = PathBuf::from(
+        args.next()
+            .context("usage: nxview assembly move <in.prt> <out.prt> --translate <name>=<dx,dy,dz> --rotate <name>=<ax,ay,az,deg> --matrix <name>=<m00,...,m23>")?,
+    );
+    let output = PathBuf::from(
+        args.next()
+            .context("usage: nxview assembly move <in.prt> <out.prt> ...")?,
+    );
+    let mut root = None;
+    let mut translate = Vec::new();
+    let mut rotate = Vec::new();
+    let mut matrix = Vec::new();
+    while let Some(argument) = args.next() {
+        let mut target = None;
+        match argument.as_str() {
+            "--root" => {
+                root = Some(PathBuf::from(
+                    args.next().context("usage: --root <directory>")?,
+                ));
+            }
+            "--translate" => target = Some(&mut translate),
+            "--rotate" => target = Some(&mut rotate),
+            "--matrix" => target = Some(&mut matrix),
+            other => bail!("unknown option: {other}"),
+        }
+        if let Some(list) = target {
+            let value = args.next().context("usage: <name>=<values>")?;
+            list.push(value);
+        }
+    }
+
+    let root = root.or_else(|| input.parent().map(Path::to_path_buf));
+    let manifest = read_assembly_manifest(&input, root.as_deref())?;
+    let frames = cadmpeg_codec_nx::read_placement_frames(&input)?;
+    let mut name_to_uuid = std::collections::HashMap::new();
+    for component in &manifest.components {
+        if !component.present {
+            continue;
+        }
+        let Ok(bytes) = cadmpeg_codec_nx::read_part_payload(&component.path) else {
+            continue;
+        };
+        if let Some(frame) = frames.iter().find(|frame| {
+            bytes
+                .windows(frame.uuid.len())
+                .any(|window| window == frame.uuid.as_bytes())
+        }) {
+            name_to_uuid.insert(component.name.clone(), frame.uuid.clone());
+        }
+    }
+
+    let mut current: std::collections::HashMap<String, [f64; 12]> =
+        std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for value in &translate {
+        let (target, values) = parse_named(value)?;
+        apply_placement_op(
+            &frames,
+            &name_to_uuid,
+            &mut current,
+            &mut order,
+            target,
+            &values,
+            "translate",
+        )?;
+    }
+    for value in &rotate {
+        let (target, values) = parse_named(value)?;
+        apply_placement_op(
+            &frames,
+            &name_to_uuid,
+            &mut current,
+            &mut order,
+            target,
+            &values,
+            "rotate",
+        )?;
+    }
+    for value in &matrix {
+        let (target, values) = parse_named(value)?;
+        apply_placement_op(
+            &frames,
+            &name_to_uuid,
+            &mut current,
+            &mut order,
+            target,
+            &values,
+            "matrix",
+        )?;
+    }
+
+    let updates: Vec<cadmpeg_codec_nx::PlacementUpdate> = order
+        .iter()
+        .filter_map(|uuid| {
+            current
+                .get(uuid)
+                .map(|matrix| cadmpeg_codec_nx::PlacementUpdate {
+                    uuid: uuid.clone(),
+                    matrix: *matrix,
+                })
+        })
+        .collect();
+    if updates.is_empty() {
+        bail!("no --translate/--rotate/--matrix operation given");
+    }
+    let report = cadmpeg_codec_nx::set_assembly_placements(&input, &output, &updates)?;
+    println!("wrote {}", report.output.display());
+    println!("updated={}", report.updated.len());
+    for uuid in &report.updated {
+        println!("  {uuid}");
+    }
+    println!("streams={:?}", report.changed_streams);
+    println!("byte_identical={}", report.byte_identical);
+
+    // Prove the written file parses and reports the requested placements.
+    for frame in cadmpeg_codec_nx::read_placement_frames(&output)? {
+        if report.updated.iter().any(|uuid| uuid == &frame.uuid) {
+            println!(
+                "  verified {} t=({:.4}, {:.4}, {:.4})",
+                frame.uuid, frame.matrix[3], frame.matrix[7], frame.matrix[11]
+            );
+        }
+    }
+    Ok(())
+}
+
+fn apply_placement_op(
+    frames: &[cadmpeg_codec_nx::PlacementFrameInfo],
+    name_to_uuid: &std::collections::HashMap<String, String>,
+    current: &mut std::collections::HashMap<String, [f64; 12]>,
+    order: &mut Vec<String>,
+    target: &str,
+    values: &[f64],
+    operation: &str,
+) -> anyhow::Result<()> {
+    let uuid = if frames.iter().any(|frame| frame.uuid == target) {
+        target.to_string()
+    } else {
+        name_to_uuid.get(target).cloned().with_context(|| {
+            format!(
+                "no placement for {target}; known components: {:?}",
+                name_to_uuid.keys().collect::<Vec<_>>()
+            )
+        })?
+    };
+    let matrix = current.entry(uuid.clone()).or_insert_with(|| {
+        frames
+            .iter()
+            .find(|frame| frame.uuid == uuid)
+            .map_or([0.0; 12], |frame| frame.matrix)
+    });
+    match operation {
+        "translate" => {
+            anyhow::ensure!(values.len() == 3, "--translate needs dx,dy,dz");
+            matrix[3] += values[0];
+            matrix[7] += values[1];
+            matrix[11] += values[2];
+        }
+        "rotate" => {
+            anyhow::ensure!(values.len() == 4, "--rotate needs ax,ay,az,deg");
+            let rotation = axis_rotation([values[0], values[1], values[2]], values[3]);
+            let old = [
+                [matrix[0], matrix[1], matrix[2]],
+                [matrix[4], matrix[5], matrix[6]],
+                [matrix[8], matrix[9], matrix[10]],
+            ];
+            let new = multiply3(rotation, old);
+            for row in 0..3 {
+                for column in 0..3 {
+                    matrix[row * 4 + column] = new[row][column];
+                }
+            }
+        }
+        "matrix" => {
+            anyhow::ensure!(values.len() == 12, "--matrix needs 12 values");
+            matrix.copy_from_slice(values);
+        }
+        _ => unreachable!(),
+    }
+    if !order.iter().any(|item| item == &uuid) {
+        order.push(uuid);
+    }
+    Ok(())
+}
+
+fn parse_named(value: &str) -> anyhow::Result<(&str, Vec<f64>)> {
+    let (name, numbers) = value
+        .split_once('=')
+        .with_context(|| format!("expected <name>=<numbers>, got {value}"))?;
+    let values = numbers
+        .split(',')
+        .map(|item| item.trim().parse::<f64>())
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("bad number list: {numbers}"))?;
+    Ok((name.trim(), values))
+}
+
+fn axis_rotation(axis: [f64; 3], degrees: f64) -> [[f64; 3]; 3] {
+    let length = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    let (x, y, z) = (axis[0] / length, axis[1] / length, axis[2] / length);
+    let angle = degrees.to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let one = 1.0 - cos;
+    [
+        [
+            cos + x * x * one,
+            x * y * one - z * sin,
+            x * z * one + y * sin,
+        ],
+        [
+            y * x * one + z * sin,
+            cos + y * y * one,
+            y * z * one - x * sin,
+        ],
+        [
+            z * x * one - y * sin,
+            z * y * one + x * sin,
+            cos + z * z * one,
+        ],
+    ]
+}
+
+fn multiply3(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            out[row][column] = (0..3).map(|k| a[row][k] * b[k][column]).sum();
+        }
+    }
+    out
+}
+
+/// Inspect or edit a RecurDyn text model and its solver range.
+fn motion_command(args: &mut impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let action = args
+        .next()
+        .context("usage: nxview motion <info|edit> ...")?;
+    match action.as_str() {
+        "info" => {
+            let path = PathBuf::from(
+                args.next()
+                    .context("usage: nxview motion info <model.rmd> [--msg <log.msg>]")?,
+            );
+            let mut msg = None;
+            while let Some(argument) = args.next() {
+                if argument == "--msg" {
+                    msg = Some(PathBuf::from(
+                        args.next().context("usage: --msg <log.msg>")?,
+                    ));
+                }
+            }
+            let model = motion_model::MotionModel::parse(&path)?;
+            println!("model={}", path.display());
+            for driver in &model.drivers {
+                println!(
+                    "  driver {} joint={:?} acceleration={:?} velocity={:?} initial={:?}",
+                    driver.name, driver.joint, driver.acceleration, driver.velocity, driver.initial
+                );
+                println!("    function = {}", driver.function);
+            }
+            let msg = msg.unwrap_or_else(|| motion_model::paired_msg(&path));
+            if msg.is_file() {
+                let range = motion_model::read_range(&msg)?;
+                println!(
+                    "  range end_time={} steps={} ({})",
+                    range.end_time,
+                    range.steps,
+                    msg.display()
+                );
+            } else {
+                println!("  range unavailable: {} not found", msg.display());
+            }
+        }
+        "edit" => {
+            let input = PathBuf::from(
+                args.next()
+                    .context("usage: nxview motion edit <in.rmd> <out.rmd> [--velocity name=value] [--function name=expr] [--end-time s] [--steps n]")?,
+            );
+            let output = PathBuf::from(
+                args.next()
+                    .context("usage: nxview motion edit <in.rmd> <out.rmd> ...")?,
+            );
+            let mut velocity = None;
+            let mut function = None;
+            let mut end_time = None;
+            let mut steps = None;
+            let mut msg_in = None;
+            let mut msg_out = None;
+            while let Some(argument) = args.next() {
+                match argument.as_str() {
+                    "--velocity" => {
+                        velocity = Some(args.next().context("usage: --velocity <driver>=<rad/s>")?);
+                    }
+                    "--function" => {
+                        function = Some(
+                            args.next()
+                                .context("usage: --function <driver>=<expression>")?,
+                        );
+                    }
+                    "--end-time" => {
+                        end_time = Some(
+                            args.next()
+                                .context("usage: --end-time <seconds>")?
+                                .parse::<f64>()?,
+                        );
+                    }
+                    "--steps" => {
+                        steps = Some(
+                            args.next()
+                                .context("usage: --steps <count>")?
+                                .parse::<u32>()?,
+                        );
+                    }
+                    "--msg" => {
+                        msg_in = Some(PathBuf::from(
+                            args.next().context("usage: --msg <log.msg>")?,
+                        ));
+                    }
+                    "--msg-out" => {
+                        msg_out = Some(PathBuf::from(
+                            args.next().context("usage: --msg-out <log.msg>")?,
+                        ));
+                    }
+                    other => bail!("unknown option: {other}"),
+                }
+            }
+            if input == output {
+                bail!("input and output must be different paths");
+            }
+            let model = motion_model::MotionModel::parse(&input)?;
+            let mut text = model.text.clone();
+            let mut changed = Vec::new();
+            if let Some(value) = velocity {
+                let (name, values) = parse_named(&value)?;
+                anyhow::ensure!(values.len() == 1, "--velocity needs <driver>=<rad/s>");
+                text = motion_model::rewrite_velocity(&text, name, values[0])?;
+                changed.push(format!("{name} velocity={}", values[0]));
+            }
+            if let Some(value) = function {
+                let (name, expression) = value
+                    .split_once('=')
+                    .with_context(|| format!("expected <driver>=<expression>, got {value}"))?;
+                text = motion_model::rewrite_function(&text, name.trim(), expression.trim())?;
+                changed.push(format!("{name} function={}", expression.trim()));
+            }
+            std::fs::write(&output, &text)?;
+            println!("wrote {}", output.display());
+            for item in &changed {
+                println!("  {item}");
+            }
+
+            let msg_in = msg_in.unwrap_or_else(|| motion_model::paired_msg(&input));
+            let msg_out = msg_out.unwrap_or_else(|| motion_model::paired_msg(&output));
+            if end_time.is_some() || steps.is_some() {
+                let source = std::fs::read_to_string(&msg_in)
+                    .with_context(|| format!("read {}", msg_in.display()))?;
+                let current = motion_model::read_range(&msg_in)?;
+                let range = motion_model::SimulationRange {
+                    end_time: end_time.unwrap_or(current.end_time),
+                    steps: steps.unwrap_or(current.steps),
+                };
+                let rewritten = motion_model::rewrite_range(&source, range)?;
+                std::fs::write(&msg_out, rewritten)?;
+                println!(
+                    "wrote {} (end_time={} steps={})",
+                    msg_out.display(),
+                    range.end_time,
+                    range.steps
+                );
+            }
+        }
+        other => bail!("unknown motion action: {other}"),
+    }
+    Ok(())
 }
 
 fn print_manifest(path: &Path, root: Option<&Path>) -> anyhow::Result<()> {
@@ -1416,23 +1953,20 @@ fn chord(default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-pub(crate) fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
-    println!("== {}", path.display());
+fn load_part_geometry(
+    path: &Path,
+    chord: f64,
+) -> anyhow::Result<Option<(Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>)>> {
     let mut input = File::open(path)?;
     let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
-    let ir = result.ir();
-    println!(
-        "bodies={} faces={} edges={} vertices={} tessellations={}",
-        ir.model.bodies.len(),
-        ir.model.faces.len(),
-        ir.model.edges.len(),
-        ir.model.vertices.len(),
-        ir.model.tessellations.len(),
-    );
-    for loss in result.report().losses.iter().take(8) {
-        println!("  {:?}: {}", loss.severity, loss.message);
+    let mesh = tessellate_ir(result.ir(), chord, false);
+    if mesh.indices.is_empty() {
+        return Ok(None);
     }
+    Ok(Some((mesh.positions, mesh.normals, mesh.indices)))
+}
 
+fn tessellate_ir(ir: &cadmpeg_ir::CadIr, chord: f64, verbose: bool) -> MeshData {
     let mut mesh = MeshData::default();
 
     // Source tessellation, when the part carries a decodable display stream.
@@ -1473,6 +2007,9 @@ pub(crate) fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
                 }
                 Err(error) => {
                     mesh.faces_refused += 1;
+                    if !verbose {
+                        continue;
+                    }
                     let limit = if std::env::var("NXVIEW_FACE_ERRORS").is_ok() {
                         usize::MAX
                     } else {
@@ -1494,6 +2031,28 @@ pub(crate) fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
             }
         }
     }
+
+    mesh
+}
+
+fn load_mesh(path: &Path, chord: f64) -> anyhow::Result<MeshData> {
+    println!("== {}", path.display());
+    let mut input = File::open(path)?;
+    let result = NxCodec.decode(&mut input, &DecodeOptions::default())?;
+    let ir = result.ir();
+    println!(
+        "bodies={} faces={} edges={} vertices={} tessellations={}",
+        ir.model.bodies.len(),
+        ir.model.faces.len(),
+        ir.model.edges.len(),
+        ir.model.vertices.len(),
+        ir.model.tessellations.len(),
+    );
+    for loss in result.report().losses.iter().take(8) {
+        println!("  {:?}: {}", loss.severity, loss.message);
+    }
+
+    let mut mesh = tessellate_ir(ir, chord, true);
 
     if let Ok(cam) = cam::load(path) {
         if !cam.moves.is_empty() {
@@ -1548,6 +2107,7 @@ fn write_obj(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "viewer", test))]
 #[derive(Clone, Copy)]
 struct CameraState {
     target: Vec3,
@@ -1556,6 +2116,7 @@ struct CameraState {
     distance: f32,
 }
 
+#[cfg(any(feature = "viewer", test))]
 impl CameraState {
     fn new(target: Vec3, extent: f32) -> Self {
         Self {
@@ -1724,6 +2285,722 @@ fn view(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
         window.update_with_buffer(&buffer, width, height)?;
     }
     Ok(())
+}
+
+#[cfg(feature = "viewer")]
+fn scene_camera(scene: &scene::Scene) -> anyhow::Result<(Vec3, f32)> {
+    let mut rest: Vec<[f32; 3]> = Vec::new();
+    for part in &scene.parts {
+        if part.visible {
+            rest.extend_from_slice(&part.rest);
+        }
+    }
+    if rest.is_empty() {
+        bail!("scene has no geometry to show");
+    }
+    let (min, max, _center) = view_bounds(&rest);
+    let target = Vec3::new(
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    );
+    let extent = (max[0] - min[0])
+        .max(max[1] - min[1])
+        .max(max[2] - min[2])
+        .max(1e-3);
+    Ok((target, extent))
+}
+
+#[cfg(feature = "viewer")]
+fn render_scene_ppm(
+    scene: &scene::Scene,
+    output: &Path,
+    width: usize,
+    height: usize,
+) -> anyhow::Result<()> {
+    let (target, extent) = scene_camera(scene)?;
+    let mut buffer = vec![0_u32; width * height];
+    let mut zbuf = vec![f32::INFINITY; width * height];
+    let mut screen: Vec<Vec3> = Vec::new();
+    let mut visible: Vec<bool> = Vec::new();
+    let mut part_ids: Vec<u32> = Vec::new();
+    render_scene(
+        scene,
+        true,
+        width,
+        height,
+        target,
+        0.65,
+        0.35,
+        extent * 1.9,
+        extent,
+        &mut buffer,
+        &mut zbuf,
+        &mut screen,
+        &mut visible,
+        &mut part_ids,
+        None,
+    );
+    write_ppm(output, &buffer, width, height)?;
+    println!(
+        "wrote {} (frame {}/{}, {:.3}s)",
+        output.display(),
+        scene.frame + 1,
+        scene.frame_count(),
+        scene.time()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "viewer"))]
+fn render_scene_ppm(
+    _scene: &scene::Scene,
+    _output: &Path,
+    _width: usize,
+    _height: usize,
+) -> anyhow::Result<()> {
+    bail!("viewer not compiled: build with --features viewer")
+}
+
+#[cfg(feature = "viewer")]
+fn bench_scene(scene: &mut scene::Scene, frames: usize) -> anyhow::Result<()> {
+    let (target, extent) = scene_camera(scene)?;
+    let width = 1200;
+    let height = 780;
+    let mut buffer = vec![0_u32; width * height];
+    let mut zbuf = vec![f32::INFINITY; width * height];
+    let mut screen: Vec<Vec3> = Vec::new();
+    let mut visible: Vec<bool> = Vec::new();
+    let mut part_ids: Vec<u32> = Vec::new();
+    let count = scene.frame_count().max(1);
+    let frames = frames.max(1);
+    let started = std::time::Instant::now();
+    for index in 0..frames {
+        scene.set_frame(index % count);
+        render_scene(
+            scene,
+            true,
+            width,
+            height,
+            target,
+            0.65,
+            0.35,
+            extent * 1.9,
+            extent,
+            &mut buffer,
+            &mut zbuf,
+            &mut screen,
+            &mut visible,
+            &mut part_ids,
+            None,
+        );
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    println!(
+        "bench: {} frame(s) at {width}x{height} in {elapsed:.3}s ({:.1} fps)",
+        frames,
+        frames as f64 / elapsed.max(1e-9)
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "viewer"))]
+fn bench_scene(_scene: &mut scene::Scene, _frames: usize) -> anyhow::Result<()> {
+    bail!("viewer not compiled: build with --features viewer")
+}
+
+#[cfg(feature = "viewer")]
+fn export_motion_model(scene: &scene::Scene) -> anyhow::Result<Option<PathBuf>> {
+    let (Some(model), Some(rmd), Some(driver)) =
+        (&scene.motion_model, &scene.rmd_path, &scene.driver)
+    else {
+        return Ok(None);
+    };
+    let text = motion_model::rewrite_velocity(&model.text, driver, scene.driver_velocity)?;
+    let stem = scene.source.file_stem().map_or_else(
+        || std::ffi::OsString::from("motion"),
+        |stem| stem.to_owned(),
+    );
+    let mut name = stem;
+    name.push("-edited.rmd");
+    let output = scene.source.with_file_name(name);
+    std::fs::write(&output, text)?;
+    let msg = motion_model::paired_msg(rmd);
+    if msg.is_file() {
+        std::fs::copy(&msg, output.with_extension("msg"))?;
+    }
+    Ok(Some(output))
+}
+
+#[cfg(feature = "viewer")]
+fn scene_view(
+    scene: &mut scene::Scene,
+    state_path: Option<PathBuf>,
+    saved_view: Option<scene::SceneViewState>,
+) -> anyhow::Result<()> {
+    let (target, extent) = scene_camera(scene)?;
+
+    let title = scene
+        .source
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let mut window = Window::new(
+        &format!("NX Scene — {title}"),
+        1200,
+        780,
+        WindowOptions {
+            resize: true,
+            ..Default::default()
+        },
+    )?;
+    window.set_target_fps(60);
+
+    let initial = if let Some(view) = saved_view {
+        CameraState {
+            target: Vec3::from(view.target),
+            yaw: view.yaw,
+            pitch: view.pitch,
+            distance: view.distance,
+        }
+    } else {
+        CameraState {
+            distance: extent * 1.9,
+            ..CameraState::new(target, extent)
+        }
+    };
+    let mut camera = initial;
+    let mut buffer: Vec<u32> = Vec::new();
+    let mut zbuf: Vec<f32> = Vec::new();
+    let mut screen: Vec<Vec3> = Vec::new();
+    let mut visible: Vec<bool> = Vec::new();
+    let mut part_ids: Vec<u32> = Vec::new();
+    let mut selected: Option<usize> = None;
+    let mut edit_axis = 0usize;
+    let mut rotate_mode = false;
+    let mut undo_stack: Vec<(usize, [f64; 12])> = Vec::new();
+    let mut left_was_down = false;
+    let mut press_at: Option<(f32, f32)> = None;
+    let mut last_orbit: Option<(f32, f32)> = None;
+    let mut last_pan: Option<(f32, f32)> = None;
+    let mut screenshot = 0usize;
+    let mut cull_backfaces = true;
+    let mut hide_static = scene.parts.iter().all(|part| !part.visible || part.moving);
+    let mut speed = scene.speed;
+    let frames = scene.frame_count().max(1);
+    let mut play_position = 0.0_f64;
+    let duration = scene
+        .animation
+        .as_ref()
+        .map_or(5.0, |animation| animation.time(frames.saturating_sub(1)))
+        .max(1e-6);
+    let mut last_clock = std::time::Instant::now();
+    let mut last_title = String::new();
+
+    println!("controls: left-drag orbit, right/middle-drag pan, wheel zoom");
+    println!(
+        "          Space play/pause, Left/Right step, PageUp/PageDown 10 frames, Home frame 0"
+    );
+    println!("          click selects a part; 1/2/3 translate X/Y/Z, 4/5/6 rotate X/Y/Z");
+    println!("          Up/Down move or rotate the selection, Shift steps 10x, U/Ctrl+Z undo");
+    println!("          W write edited assembly, [ ] driver speed, Ctrl+E export motion model");
+    println!("          Ctrl+S save view state, G static parts, B backface culling");
+    println!("          R reset, F fit, S screenshot, P state, Esc close");
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        let (width, height) = window.get_size();
+        if width == 0 || height == 0 {
+            continue;
+        }
+        if buffer.len() != width * height {
+            buffer = vec![0; width * height];
+            zbuf = vec![f32::INFINITY; width * height];
+        }
+
+        if window.is_key_pressed(Key::Space, KeyRepeat::No) {
+            scene.playing = !scene.playing;
+            play_position = scene.frame as f64;
+            last_clock = std::time::Instant::now();
+            println!("{}", if scene.playing { "playing" } else { "paused" });
+        }
+        let mut step = 0_i64;
+        if window.is_key_pressed(Key::Right, KeyRepeat::No) {
+            step = 1;
+        }
+        if window.is_key_pressed(Key::Left, KeyRepeat::No) {
+            step = -1;
+        }
+        if window.is_key_pressed(Key::PageUp, KeyRepeat::No) {
+            step = 10;
+        }
+        if window.is_key_pressed(Key::PageDown, KeyRepeat::No) {
+            step = -10;
+        }
+        if window.is_key_pressed(Key::Home, KeyRepeat::No) {
+            scene.playing = false;
+            scene.set_frame(0);
+            play_position = 0.0;
+        }
+        if step != 0 {
+            scene.playing = false;
+            let next = (scene.frame as i64 + step).clamp(0, frames as i64 - 1) as usize;
+            scene.set_frame(next);
+            play_position = next as f64;
+        }
+
+        // Part selection and transform editing.
+        let mut picked_axis = None;
+        if window.is_key_pressed(Key::Key1, KeyRepeat::No) {
+            picked_axis = Some((0, false));
+        }
+        if window.is_key_pressed(Key::Key2, KeyRepeat::No) {
+            picked_axis = Some((1, false));
+        }
+        if window.is_key_pressed(Key::Key3, KeyRepeat::No) {
+            picked_axis = Some((2, false));
+        }
+        if window.is_key_pressed(Key::Key4, KeyRepeat::No) {
+            picked_axis = Some((0, true));
+        }
+        if window.is_key_pressed(Key::Key5, KeyRepeat::No) {
+            picked_axis = Some((1, true));
+        }
+        if window.is_key_pressed(Key::Key6, KeyRepeat::No) {
+            picked_axis = Some((2, true));
+        }
+        if let Some((axis, rotate)) = picked_axis {
+            edit_axis = axis;
+            rotate_mode = rotate;
+            println!(
+                "{} axis {}",
+                if rotate {
+                    "rotate about"
+                } else {
+                    "translate along"
+                },
+                ["X", "Y", "Z"][axis]
+            );
+        }
+        let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+        let up = window.is_key_pressed(Key::Up, KeyRepeat::No);
+        let down = window.is_key_pressed(Key::Down, KeyRepeat::No);
+        if (up || down) && selected.is_none() {
+            println!("no part selected; click one first");
+        }
+        if (up || down) && selected.is_some() {
+            let index = selected.expect("selection checked");
+            let sign = if up { 1.0 } else { -1.0 };
+            let matrix_before = scene.parts[index].matrix;
+            let mut matrix = matrix_before;
+            if rotate_mode {
+                let mut axis = [0.0; 3];
+                axis[edit_axis] = 1.0;
+                let angle = sign * if shift { 45.0 } else { 5.0 };
+                let rotation = axis_rotation(axis, angle);
+                let old = [
+                    [matrix[0], matrix[1], matrix[2]],
+                    [matrix[4], matrix[5], matrix[6]],
+                    [matrix[8], matrix[9], matrix[10]],
+                ];
+                let new = multiply3(rotation, old);
+                for row in 0..3 {
+                    for column in 0..3 {
+                        matrix[row * 4 + column] = new[row][column];
+                    }
+                }
+            } else {
+                matrix[3 + edit_axis * 4] += sign * if shift { 10.0 } else { 1.0 };
+            }
+            undo_stack.push((index, matrix_before));
+            let label = scene.parts[index].label.clone();
+            scene.set_placement(index, matrix);
+            println!(
+                "{} {} {} {:.3}",
+                label,
+                if rotate_mode { "rotated" } else { "moved" },
+                ["X", "Y", "Z"][edit_axis],
+                matrix[3 + edit_axis * 4]
+            );
+        }
+        let undo = window.is_key_pressed(Key::U, KeyRepeat::No)
+            || window.is_key_pressed(Key::Z, KeyRepeat::No)
+                && (window.is_key_down(Key::LeftCtrl)
+                    || window.is_key_down(Key::RightCtrl)
+                    || window.is_key_down(Key::LeftSuper)
+                    || window.is_key_down(Key::RightSuper));
+        if undo {
+            if let Some((index, matrix)) = undo_stack.pop() {
+                let label = scene.parts[index].label.clone();
+                scene.set_placement(index, matrix);
+                println!("undo {label}");
+            } else {
+                println!("nothing to undo");
+            }
+        }
+        if window.is_key_pressed(Key::W, KeyRepeat::No) {
+            let output = scene.edited_assembly_path();
+            match scene.save_placements(&output) {
+                Ok(count) => {
+                    for part in &mut scene.parts {
+                        part.base_matrix = part.matrix;
+                    }
+                    println!("wrote {count} placement(s) to {}", output.display());
+                }
+                Err(error) => println!("save failed: {error}"),
+            }
+        }
+        if window.is_key_pressed(Key::RightBracket, KeyRepeat::No) {
+            if let Some(base) = scene.base_velocity {
+                scene.driver_velocity *= 1.1;
+                scene.speed = (scene.driver_velocity / base).clamp(0.05, 16.0);
+                speed = scene.speed;
+                println!(
+                    "driver velocity {:.4} rad/s ({:.2}x)",
+                    scene.driver_velocity, speed
+                );
+            } else {
+                println!("no RecurDyn driver loaded");
+            }
+        }
+        if window.is_key_pressed(Key::LeftBracket, KeyRepeat::No) {
+            if let Some(base) = scene.base_velocity {
+                scene.driver_velocity /= 1.1;
+                scene.speed = (scene.driver_velocity / base).clamp(0.05, 16.0);
+                speed = scene.speed;
+                println!(
+                    "driver velocity {:.4} rad/s ({:.2}x)",
+                    scene.driver_velocity, speed
+                );
+            } else {
+                println!("no RecurDyn driver loaded");
+            }
+        }
+        let command = window.is_key_down(Key::LeftCtrl)
+            || window.is_key_down(Key::RightCtrl)
+            || window.is_key_down(Key::LeftSuper)
+            || window.is_key_down(Key::RightSuper);
+        if command && window.is_key_pressed(Key::E, KeyRepeat::No) {
+            match export_motion_model(scene) {
+                Ok(Some(path)) => println!(
+                    "wrote {} (NX does not re-solve; re-import the model in NX Motion)",
+                    path.display()
+                ),
+                Ok(None) => println!("no RecurDyn model loaded"),
+                Err(error) => println!("export failed: {error}"),
+            }
+        }
+        if window.is_key_pressed(Key::Equal, KeyRepeat::No)
+            || window.is_key_pressed(Key::NumPadPlus, KeyRepeat::No)
+        {
+            speed = (speed * 1.25).min(16.0);
+            scene.speed = speed;
+            println!("speed {speed:.2}x");
+        }
+        if window.is_key_pressed(Key::Minus, KeyRepeat::No)
+            || window.is_key_pressed(Key::NumPadMinus, KeyRepeat::No)
+        {
+            speed = (speed / 1.25).max(0.05);
+            scene.speed = speed;
+            println!("speed {speed:.2}x");
+        }
+        let command = window.is_key_down(Key::LeftCtrl)
+            || window.is_key_down(Key::RightCtrl)
+            || window.is_key_down(Key::LeftSuper)
+            || window.is_key_down(Key::RightSuper);
+        if command && window.is_key_pressed(Key::S, KeyRepeat::No) {
+            if let Some(path) = &state_path {
+                let mut state = scene::state_from_scene(scene);
+                state.view = Some(scene::SceneViewState {
+                    target: [camera.target.x, camera.target.y, camera.target.z],
+                    yaw: camera.yaw,
+                    pitch: camera.pitch,
+                    distance: camera.distance,
+                });
+                scene::save_state(path, &state)?;
+                println!("saved state {}", path.display());
+            } else {
+                println!("state saving disabled (--no-state)");
+            }
+        }
+        if window.is_key_pressed(Key::G, KeyRepeat::No) {
+            hide_static = !hide_static;
+            for part in &mut scene.parts {
+                part.visible = !hide_static || part.moving;
+            }
+            println!(
+                "static parts: {}",
+                if hide_static { "hidden" } else { "shown" }
+            );
+        }
+        if window.is_key_pressed(Key::B, KeyRepeat::No) {
+            cull_backfaces = !cull_backfaces;
+            println!(
+                "backface culling: {}",
+                if cull_backfaces { "on" } else { "off" }
+            );
+        }
+        if window.is_key_pressed(Key::R, KeyRepeat::No) {
+            camera = initial;
+            println!("camera reset");
+        }
+        if window.is_key_pressed(Key::F, KeyRepeat::No) {
+            camera.target = target;
+            camera.distance = extent * 1.9;
+            println!("camera fit");
+        }
+        if window.is_key_pressed(Key::P, KeyRepeat::No) {
+            println!(
+                "frame={}/{} t={:.3}s camera target=({:.3}, {:.3}, {:.3}) yaw={:.3} pitch={:.3} distance={:.3}",
+                scene.frame + 1,
+                frames,
+                scene.time(),
+                camera.target.x,
+                camera.target.y,
+                camera.target.z,
+                camera.yaw,
+                camera.pitch,
+                camera.distance
+            );
+        }
+        if window.is_key_pressed(Key::S, KeyRepeat::No) {
+            let path = PathBuf::from(format!("nxview-scene-{screenshot}.ppm"));
+            write_ppm(&path, &buffer, width, height)?;
+            println!("wrote {}", path.display());
+            screenshot += 1;
+        }
+
+        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Discard) {
+            let left_down = window.get_mouse_down(MouseButton::Left);
+            if left_down {
+                if !left_was_down {
+                    press_at = Some((mx, my));
+                }
+                if let Some((lx, ly)) = last_orbit {
+                    camera.orbit(mx - lx, my - ly);
+                }
+                last_orbit = Some((mx, my));
+            } else {
+                if left_was_down {
+                    if let Some((px, py)) = press_at {
+                        if (mx - px).abs() + (my - py).abs() < 4.0 {
+                            let x = mx as usize;
+                            let y = my as usize;
+                            if x < width && y < height && part_ids.len() == width * height {
+                                let id = part_ids[y * width + x];
+                                selected = if id == 0 { None } else { Some(id as usize - 1) };
+                                match selected {
+                                    Some(index) => {
+                                        println!("selected {}", scene.parts[index].label)
+                                    }
+                                    None => println!("selection cleared"),
+                                }
+                            }
+                        }
+                    }
+                }
+                last_orbit = None;
+                press_at = None;
+            }
+            left_was_down = left_down;
+            if window.get_mouse_down(MouseButton::Right)
+                || window.get_mouse_down(MouseButton::Middle)
+            {
+                if let Some((lx, ly)) = last_pan {
+                    camera.pan(mx - lx, my - ly, height);
+                }
+                last_pan = Some((mx, my));
+            } else {
+                last_pan = None;
+            }
+        }
+
+        if let Some((_, scroll)) = window.get_scroll_wheel() {
+            camera.zoom(scroll, extent);
+        }
+
+        if scene.playing && frames > 1 {
+            let elapsed = last_clock.elapsed().as_secs_f64();
+            last_clock = std::time::Instant::now();
+            play_position += elapsed * speed * (frames - 1) as f64 / duration;
+            if play_position >= frames as f64 {
+                play_position %= frames as f64;
+            }
+            scene.set_frame(play_position as usize);
+        } else {
+            last_clock = std::time::Instant::now();
+        }
+
+        render_scene(
+            scene,
+            cull_backfaces,
+            width,
+            height,
+            camera.target,
+            camera.yaw,
+            camera.pitch,
+            camera.distance,
+            extent,
+            &mut buffer,
+            &mut zbuf,
+            &mut screen,
+            &mut visible,
+            &mut part_ids,
+            selected,
+        );
+
+        let title = format!(
+            "NX Scene — {} — frame {}/{} t={:.3}s [{}]",
+            title,
+            scene.frame + 1,
+            frames,
+            scene.time(),
+            if scene.playing { "play" } else { "pause" }
+        );
+        if title != last_title {
+            let _ = window.set_title(&title);
+            last_title = title;
+        }
+        window.update_with_buffer(&buffer, width, height)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+fn render_scene(
+    scene: &scene::Scene,
+    cull_backfaces: bool,
+    width: usize,
+    height: usize,
+    target: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    extent: f32,
+    buffer: &mut [u32],
+    zbuf: &mut [f32],
+    screen: &mut Vec<Vec3>,
+    visible: &mut Vec<bool>,
+    part_ids: &mut Vec<u32>,
+    selected: Option<usize>,
+) {
+    buffer.fill(0x000b1119);
+    zbuf.fill(f32::INFINITY);
+    if part_ids.len() != width * height {
+        part_ids.clear();
+        part_ids.resize(width * height, 0);
+    } else {
+        part_ids.fill(0);
+    }
+
+    let eye = target
+        + Vec3::new(
+            distance * pitch.cos() * yaw.sin(),
+            distance * pitch.sin(),
+            distance * pitch.cos() * yaw.cos(),
+        );
+    let aspect = width as f32 / height as f32;
+    let near = (extent * 0.005).max(1e-4);
+    let far = (extent * 200.0).max(near * 10.0);
+    let view_matrix = view::look_at_mat4(eye, target, Vec3::Y);
+    let projection = opengl::perspective(45_f32.to_radians(), aspect, near, far);
+    let mvp = projection * view_matrix;
+    let light = Vec3::new(-0.4, 0.78, 0.55).normalize();
+
+    for (part_index, part) in scene.parts.iter().enumerate() {
+        if !part.visible || part.indices.is_empty() {
+            continue;
+        }
+        screen.clear();
+        screen.resize(part.positions.len(), Vec3::ZERO);
+        visible.clear();
+        visible.resize(part.positions.len(), false);
+        for (index, position) in part.positions.iter().enumerate() {
+            let clip = mvp * Vec4::new(position[0], position[1], position[2], 1.0);
+            if clip.w <= 1e-6 {
+                continue;
+            }
+            let inv_w = 1.0 / clip.w;
+            screen[index] = Vec3::new(
+                (clip.x * inv_w * 0.5 + 0.5) * width as f32,
+                (1.0 - (clip.y * inv_w * 0.5 + 0.5)) * height as f32,
+                clip.z * inv_w * 0.5 + 0.5,
+            );
+            visible[index] = true;
+        }
+
+        let mut base = Vec3::from(part.color);
+        if selected == Some(part_index) {
+            base = base * 0.45 + Vec3::new(1.0, 0.55, 0.15) * 0.55;
+        }
+        for triangle in part.indices.chunks_exact(3) {
+            let indices = [
+                triangle[0] as usize,
+                triangle[1] as usize,
+                triangle[2] as usize,
+            ];
+            if indices.iter().any(|index| !visible[*index]) {
+                continue;
+            }
+            if cull_backfaces {
+                let normal = Vec3::from(part.normals[indices[0]]);
+                let to_eye = eye - Vec3::from(part.positions[indices[0]]);
+                if normal.dot(to_eye) <= 0.0 {
+                    continue;
+                }
+            }
+            let a = screen[indices[0]];
+            let b = screen[indices[1]];
+            let c = screen[indices[2]];
+            let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            if area.abs() < 0.3 {
+                continue;
+            }
+            let inv_area = 1.0 / area;
+
+            let min_x = a.x.min(b.x).min(c.x).floor().max(0.0) as usize;
+            let max_x = (a.x.max(b.x).max(c.x).ceil() as usize).min(width - 1);
+            let min_y = a.y.min(b.y).min(c.y).floor().max(0.0) as usize;
+            let max_y = (a.y.max(b.y).max(c.y).ceil() as usize).min(height - 1);
+            if min_x > max_x || min_y > max_y {
+                continue;
+            }
+
+            let n0 = Vec3::from(part.normals[indices[0]]);
+            let n1 = Vec3::from(part.normals[indices[1]]);
+            let n2 = Vec3::from(part.normals[indices[2]]);
+
+            for y in min_y..=max_y {
+                let py = y as f32 + 0.5;
+                for x in min_x..=max_x {
+                    let px = x as f32 + 0.5;
+                    let w0 = ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) * inv_area;
+                    let w1 = ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) * inv_area;
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        continue;
+                    }
+                    let z = w0 * a.z + w1 * b.z + w2 * c.z;
+                    let offset = y * width + x;
+                    if z >= zbuf[offset] {
+                        continue;
+                    }
+                    zbuf[offset] = z;
+
+                    let normal = (n0 * w0 + n1 * w1 + n2 * w2).normalize_or_zero();
+                    let diffuse = normal.dot(light).abs();
+                    let fog = (1.0 - z).clamp(0.0, 1.0) * 0.10;
+                    let shade = 0.24 + 0.76 * diffuse + fog;
+                    let r = (base.x * shade * 255.0).clamp(0.0, 255.0) as u32;
+                    let g = (base.y * shade * 255.0).clamp(0.0, 255.0) as u32;
+                    let b = (base.z * shade * 255.0).clamp(0.0, 255.0) as u32;
+                    buffer[offset] = (r << 16) | (g << 8) | b;
+                    part_ids[offset] = part_index as u32 + 1;
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

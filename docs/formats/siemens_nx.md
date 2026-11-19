@@ -581,8 +581,14 @@ Assembly `.prt` files contain no inline Parasolid partition, deltas, or plain ca
 
 **Assembly placement frames.**
 
-An assembly placement frame in `/Root/UG_PART/UG_PART` begins with
-`ff 00 45 01 04 01`. Twelve scalar atoms follow in row-major order as a
+An assembly placement frame in `/Root/UG_PART/UG_PART` begins with the
+four-byte core `45 01 04 01`. NX12 prefixes the core with `ff 00`, so the
+NX12 form is `ff 00 45 01 04 01`; NX10 (legacy CFB) writes the core
+directly, with unrelated record-context bytes in front of it. A scanner
+therefore searches for the core and, when the two bytes before it are
+`ff 00`, retains them as part of the frame.
+
+Twelve scalar atoms follow in row-major order as a
 three-by-four matrix. Each row contains three rotation entries and one
 translation entry.
 
@@ -602,13 +608,11 @@ from the identity matrix by less than `1e-4`, and the rotation determinant
 differs from positive one by less than `1e-4`.
 
 The matrix is followed by `00 00 00 01`, a five-byte trailer whose second
-byte is `f0`, a label frame, and a UUID frame. Each text frame is
+byte is `f0`, a label frame, and a UID frame. Each text frame is
 `03, length:u8, ASCII[length-2], 00`, with `length >= 2`. Text payloads
-contain no control bytes. NX 12 and later store a 36-character canonical
-lowercase UUID in the UUID frame (`length = 38`). NX 10 stores an opaque
-identity string in that frame, for example
-`laptop-fc1.GenuineInt.1558328259.0.18420.8`. The decoder retains either text
-verbatim.
+contain no zero bytes. The UID frame carries either 36 canonical lowercase
+UUID characters (`length = 38`) or an NX object-manager UID of the form
+`host.GenuineInt.<id>.<id>.<id>.<id>` on legacy and NX10 files.
 
 The native placement retains the complete frame bytes, matrix, label,
 identity text, and container-image source offset. Equal identities or matrices

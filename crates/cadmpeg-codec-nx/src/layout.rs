@@ -58,14 +58,17 @@ pub(crate) mod token {
 
 /// Byte offsets for the `assembly_placement_prefix` record.
 ///
-/// Spec §2.3. Record length 6 B.
+/// Spec §2.3. NX10 writes the four-byte frame core directly; NX12 prefixes
+/// it with `ff 00` (record length 6 B).
 ///
 /// ```text
 /// Twelve variable-width matrix atoms follow this fixed prefix.
 /// ```
 pub(crate) mod assembly_placement_prefix {
-    /// Stated value of `magic` (`bytes[6]`). Spec §2.3.
-    pub(crate) const MAGIC_VALUE: [u8; 6] = [0xff, 0x00, 0x45, 0x01, 0x04, 0x01];
+    /// Frame core (`45 01 04 01`). Spec §2.3.
+    pub(crate) const MAGIC_VALUE: [u8; 4] = [0x45, 0x01, 0x04, 0x01];
+    /// NX12 prefixed form. Spec §2.3.
+    pub(crate) const PREFIXED_MAGIC_VALUE: [u8; 6] = [0xff, 0x00, 0x45, 0x01, 0x04, 0x01];
 }
 
 /// Byte offsets for the `assembly_placement_prefix_legacy` record.

@@ -39,6 +39,44 @@ impl<'de> serde::Deserialize<'de> for CanonicalUuid<String> {
     }
 }
 
+/// Placement-UID text: either canonical lowercase UUID text or an NX OM UID
+/// such as `laptop-fc1.GenuineInt.1558328259.0.18420.8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlacementUid<S>(S);
+
+impl<S: crate::immutable_text::ImmutableText> PlacementUid<S> {
+    pub(crate) fn new(value: S) -> Result<Self, &'static str> {
+        let text = value.as_ref();
+        let canonical = CanonicalUuid::new(text).is_ok();
+        if canonical
+            || (!text.is_empty()
+                && text.len() <= 255
+                && text.bytes().all(|byte| !byte.is_ascii_control()))
+        {
+            Ok(Self(value))
+        } else {
+            Err("uid: must be canonical UUID text or an NX OM UID string")
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl<S: crate::immutable_text::ImmutableText> serde::Serialize for PlacementUid<S> {
+    fn serialize<T: serde::Serializer>(&self, serializer: T) -> Result<T::Ok, T::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PlacementUid<String> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::CanonicalUuid;

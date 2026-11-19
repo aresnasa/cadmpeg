@@ -8,11 +8,13 @@ use cadmpeg_core::CodecError;
 use cadmpeg_ir::native::bytes::NativeBytes;
 use serde::{Deserialize, Serialize};
 
+use crate::canonical_uuid::PlacementUid;
 use crate::container::{Container, EntryContent};
-use crate::layout::assembly_placement_prefix::MAGIC_VALUE;
+use crate::layout::assembly_placement_prefix::{MAGIC_VALUE, PREFIXED_MAGIC_VALUE};
 use crate::layout::assembly_placement_prefix_legacy::MAGIC_VALUE as LEGACY_MAGIC_VALUE;
 
 const ENTRY_NAME: &str = "/Root/UG_PART/UG_PART";
+const DISPLAY_JT_ENTRY: &str = "/Root/UG_PART/DisplayJT";
 const ID_PREFIX: &str = "nx:assembly:placement#";
 const EPS_PLACEMENT_ROTATION: f64 = 1e-4;
 
@@ -25,7 +27,7 @@ pub(crate) struct AssemblyPlacement {
     /// Row-major three-by-four matrix in the serialized translation unit.
     pub(crate) matrix: [f64; 12],
     pub(crate) label: String,
-    pub(crate) uuid: String,
+    pub(crate) uuid: PlacementUid<String>,
     pub(crate) source_entry: String,
     /// Offset within the container image, including virtual legacy images.
     pub(crate) source_offset: u64,
@@ -37,7 +39,7 @@ struct AssemblyPlacementWire {
     raw_frame: NativeBytes,
     matrix: [f64; 12],
     label: String,
-    uuid: String,
+    uuid: PlacementUid<String>,
     source_entry: String,
     source_offset: u64,
 }
@@ -55,7 +57,7 @@ impl TryFrom<AssemblyPlacementWire> for AssemblyPlacement {
                 .zip(wire.matrix)
                 .any(|(a, b)| a.to_bits() != b.to_bits())
             || frame.label != wire.label
-            || frame.uuid != wire.uuid
+            || frame.uuid.as_str() != wire.uuid.as_str()
         {
             return Err("assembly placement fields must match the complete raw_frame");
         }
@@ -65,7 +67,7 @@ impl TryFrom<AssemblyPlacementWire> for AssemblyPlacement {
             .filter(|s| s.bytes().all(|b| b.is_ascii_digit()) && (*s == "0" || !s.starts_with('0')))
             .and_then(|s| s.parse::<u64>().ok());
         if ordinal != Some(wire.source_offset)
-            || wire.source_entry != ENTRY_NAME
+            || !matches!(wire.source_entry.as_str(), ENTRY_NAME | DISPLAY_JT_ENTRY)
             || wire
                 .source_offset
                 .checked_add(u64_from_index(frame.length))
@@ -89,7 +91,7 @@ struct ParsedFrame<'a> {
     length: usize,
     matrix: [f64; 12],
     label: &'a str,
-    uuid: &'a str,
+    uuid: PlacementUid<&'a str>,
 }
 
 fn matrix_atom(view: &mut View<'_>) -> Option<f64> {
@@ -151,23 +153,24 @@ fn text_frame<'a>(view: &mut View<'a>) -> Option<&'a str> {
     std::str::from_utf8(bytes).ok()
 }
 
-fn prefix_len(window: &[u8]) -> Option<usize> {
-    if window.starts_with(&MAGIC_VALUE) {
-        Some(MAGIC_VALUE.len())
-    } else if window.starts_with(&LEGACY_MAGIC_VALUE) {
-        Some(LEGACY_MAGIC_VALUE.len())
-    } else {
-        None
-    }
-}
-
 fn parse_frame(mut view: View<'_>) -> Option<ParsedFrame<'_>> {
     let start = view.position();
-    view.skip(prefix_len(view.window())?)?;
-    let mut matrix = [0.0; 12];
-    for entry in &mut matrix {
-        *entry = matrix_atom(&mut view)?;
+    // NX12 prefixes the four-byte core with `ff 00`; NX10 starts the frame
+    // with the core itself.
+    if view.window().starts_with(&PREFIXED_MAGIC_VALUE) {
+        view.take(PREFIXED_MAGIC_VALUE.len())?;
+    } else if view.window().starts_with(&LEGACY_MAGIC_VALUE) {
+        view.take(LEGACY_MAGIC_VALUE.len())?;
+    } else {
+        return None;
     }
+    let matrix = {
+        let mut matrix = [0.0; 12];
+        for entry in &mut matrix {
+            *entry = matrix_atom(&mut view)?;
+        }
+        matrix
+    };
     if !rigid_rotation(&matrix) || view.array::<4>()? != [0, 0, 0, 1] {
         return None;
     }
@@ -175,7 +178,7 @@ fn parse_frame(mut view: View<'_>) -> Option<ParsedFrame<'_>> {
         return None;
     }
     let label = text_frame(&mut view)?;
-    let uuid = text_frame(&mut view)?;
+    let uuid = PlacementUid::new(text_frame(&mut view)?).ok()?;
     Some(ParsedFrame {
         length: view.position().checked_sub(start)?,
         matrix,
@@ -184,66 +187,111 @@ fn parse_frame(mut view: View<'_>) -> Option<ParsedFrame<'_>> {
     })
 }
 
+/// One decoded frame with its byte span inside a stream.
+pub(crate) struct ParsedFrameData {
+    pub(crate) uuid: String,
+    pub(crate) label: String,
+    pub(crate) matrix: [f64; 12],
+    /// Frame byte length, including the prefix and both text frames.
+    pub(crate) length: usize,
+}
+
+/// Decode every complete placement frame in one stream image.
+///
+/// Returns `(offset, frame)` pairs, where `offset` is relative to `bytes`.
+pub(crate) fn frames_in_bytes(bytes: &[u8]) -> Vec<(usize, ParsedFrameData)> {
+    let view = View::over_retained(bytes);
+    let mut frames = Vec::new();
+    let mut cursor = 0;
+    while cursor + MAGIC_VALUE.len() <= bytes.len() {
+        let Some(found) = bytes[cursor..]
+            .windows(MAGIC_VALUE.len())
+            .position(|window| window == MAGIC_VALUE)
+        else {
+            break;
+        };
+        let core = cursor + found;
+        let start = if core >= 2 && bytes.get(core - 2..core) == Some(&[0xff, 0x00][..]) {
+            core - 2
+        } else {
+            core
+        };
+        let Some(candidate) = view.child(start, bytes.len()) else {
+            break;
+        };
+        match parse_frame(candidate) {
+            Some(frame) => {
+                frames.push((
+                    start,
+                    ParsedFrameData {
+                        uuid: frame.uuid.as_str().to_owned(),
+                        label: frame.label.to_owned(),
+                        matrix: frame.matrix,
+                        length: frame.length,
+                    },
+                ));
+                cursor = start + frame.length;
+            }
+            None => cursor = core + MAGIC_VALUE.len(),
+        }
+    }
+    frames
+}
+
+/// One complete placement frame together with the stream span it occupies.
+pub(crate) struct PlacementFrameSpan {
+    /// UID text carried by the frame.
+    pub(crate) uuid: String,
+    /// Row-major three-by-four matrix.
+    pub(crate) matrix: [f64; 12],
+    /// Label text carried by the frame.
+    pub(crate) label: String,
+    /// Stream name as stored in the container directory.
+    pub(crate) entry: String,
+    /// Absolute stream offset in the container image.
+    pub(crate) entry_offset: u64,
+    /// Frame offset within the stream and its byte length.
+    pub(crate) frame_relative: usize,
+    pub(crate) frame_length: usize,
+}
+
+/// Retain every complete placement frame with its stream span.
+pub(crate) fn placement_frame_spans(container: &Container<'_>) -> Vec<PlacementFrameSpan> {
+    let image = container.data.view();
+    let mut spans = Vec::new();
+    for entry in container.entries.iter().filter(|entry| {
+        matches!(
+            entry.content(),
+            EntryContent::PartPayload | EntryContent::DisplayJt
+        )
+    }) {
+        scan_entry(image, entry, &mut spans);
+    }
+    spans
+}
+
 /// Retain complete frames without inferring a child identity or unit conversion.
 pub(in crate::native) fn assembly_placements(
     container: &Container<'_>,
 ) -> Result<Vec<AssemblyPlacement>, CodecError> {
-    let mut entries = container
-        .entries
-        .iter()
-        .filter(|e| e.content() == EntryContent::PartPayload);
-    let Some(entry) = entries.next() else {
-        return Ok(Vec::new());
-    };
-    if entries.next().is_some() {
-        return Ok(Vec::new());
-    }
-    let Some((offset, length)) = entry.file_span() else {
-        return Ok(Vec::new());
-    };
     let image = container.data.view();
-    let Some(start) = usize::try_from(offset)
-        .ok()
-        .and_then(|n| image.start().checked_add(n))
-    else {
-        return Ok(Vec::new());
-    };
-    let Some(end) = usize::try_from(length)
-        .ok()
-        .and_then(|n| start.checked_add(n))
-    else {
-        return Ok(Vec::new());
-    };
-    let Some(payload) = image.child(start, end) else {
-        return Ok(Vec::new());
-    };
-    let window = payload.window();
-
     let mut records = Vec::new();
-    let mut relative = 0;
-    while relative <= window.len().saturating_sub(LEGACY_MAGIC_VALUE.len()) {
-        let Some(prefix) = prefix_len(&window[relative..]) else {
-            relative += 1;
+    for span in placement_frame_spans(container) {
+        let Some(source_offset) = span
+            .entry_offset
+            .checked_add(u64_from_index(span.frame_relative))
+        else {
             continue;
         };
-        let Some(candidate_start) = start.checked_add(relative) else {
-            break;
-        };
-        let Some(candidate) = payload.child(candidate_start, end) else {
-            relative += prefix;
+        let Some(start) = usize::try_from(source_offset).ok() else {
             continue;
         };
-        let Some(frame) = parse_frame(candidate) else {
-            relative += prefix;
-            continue;
-        };
-        let Some(source_offset) = offset.checked_add(u64_from_index(relative)) else {
-            break;
-        };
-        let raw = candidate
+        let Some(raw) = image
             .window()
-            .get(..frame.length)
-            .ok_or_else(|| CodecError::malformed("NX placement frame span"))?;
+            .get(start..start.saturating_add(span.frame_length))
+        else {
+            return Err(CodecError::malformed("NX placement frame span"));
+        };
         let mut id = String::new();
         write!(id, "{ID_PREFIX}{source_offset}").map_err(|_| {
             CodecError::malformed(format_args!(
@@ -253,16 +301,71 @@ pub(in crate::native) fn assembly_placements(
         })?;
         records.push(AssemblyPlacement {
             id,
-            raw_frame: (raw).to_vec().into(),
-            matrix: frame.matrix,
-            label: (frame.label).to_owned(),
-            uuid: frame.uuid.to_owned(),
-            source_entry: entry.name.clone(),
+            raw_frame: raw.to_vec().into(),
+            matrix: span.matrix,
+            label: span.label,
+            uuid: PlacementUid::new(span.uuid)
+                .map_err(|_| CodecError::malformed("NX placement UUID"))?,
+            source_entry: span.entry,
             source_offset,
         });
-        relative += frame.length;
     }
     Ok(records)
+}
+
+/// Scan one placement-bearing stream and append every complete frame.
+fn scan_entry(
+    image: View<'_>,
+    entry: &crate::container::DirEntry,
+    spans: &mut Vec<PlacementFrameSpan>,
+) {
+    let Some((offset, length)) = entry.file_span() else {
+        return;
+    };
+    let Some(start) = usize::try_from(offset)
+        .ok()
+        .and_then(|n| image.start().checked_add(n))
+    else {
+        return;
+    };
+    let Some(end) = usize::try_from(length)
+        .ok()
+        .and_then(|n| start.checked_add(n))
+    else {
+        return;
+    };
+    let Some(payload) = image.child(start, end) else {
+        return;
+    };
+    for (relative, bytes) in payload.window().windows(MAGIC_VALUE.len()).enumerate() {
+        if bytes != MAGIC_VALUE {
+            continue;
+        }
+        // A `ff 00` in front of the core belongs to the NX12 form and must be
+        // part of the retained frame.
+        let core_relative = if relative >= 2
+            && payload.window().get(relative - 2..relative) == Some(&[0xff, 0x00][..])
+        {
+            relative - 2
+        } else {
+            relative
+        };
+        let Some(candidate) = payload.child(start + core_relative, end) else {
+            continue;
+        };
+        let Some(frame) = parse_frame(candidate) else {
+            continue;
+        };
+        spans.push(PlacementFrameSpan {
+            uuid: frame.uuid.as_str().to_owned(),
+            matrix: frame.matrix,
+            label: frame.label.to_owned(),
+            entry: entry.name.clone(),
+            entry_offset: offset,
+            frame_relative: core_relative,
+            frame_length: frame.length,
+        });
+    }
 }
 
 #[cfg(test)]

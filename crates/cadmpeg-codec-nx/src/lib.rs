@@ -114,6 +114,7 @@ mod om;
 mod om_tokens;
 mod parasolid;
 mod payload_text;
+mod placement_edit;
 mod printable_string;
 mod records;
 mod scan_notes;
@@ -137,6 +138,10 @@ pub use assembly::{
 pub use edit::{
     read_part_attributes, replace_cfb_stream, set_part_attribute, EditError, EditReport,
     PartAttribute, PART_ATTRS_STREAM,
+};
+pub use placement_edit::{
+    read_part_payload, read_placement_frames, set_assembly_placements, PlacementEditReport,
+    PlacementFrameInfo, PlacementUpdate,
 };
 
 /// One decoded NX assembly placement frame.

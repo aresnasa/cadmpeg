@@ -5,8 +5,9 @@
 //! writer copies every other stream and storage verbatim, so unknown data does
 //! not pass through the NX object model during a metadata edit.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -61,6 +62,9 @@ pub enum EditError {
     /// An existing attribute has an incompatible owner.
     #[error("attribute already exists with a different owner: {0}")]
     ConflictingAttribute(String),
+    /// A placement frame or matrix value cannot be written.
+    #[error("invalid placement: {0}")]
+    InvalidPlacement(String),
     /// Underlying I/O or CFB failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -990,6 +994,21 @@ pub(crate) fn copy_cfb_with_replacement(
     replaced_stream: &str,
     replacement: &[u8],
 ) -> Result<(), EditError> {
+    copy_cfb_with_replacements(
+        source,
+        output,
+        &HashMap::from([(replaced_stream.to_string(), replacement.to_vec())]),
+    )
+}
+
+/// Copy every CFB entry, replacing the named streams with new payloads.
+///
+/// Names are compared without the leading slash that `cfb` crate paths use.
+pub(crate) fn copy_cfb_with_replacements<R: Read + Seek>(
+    source: &mut cfb::CompoundFile<R>,
+    output: &Path,
+    replacements: &HashMap<String, Vec<u8>>,
+) -> Result<(), EditError> {
     let entries: Vec<_> = source
         .walk()
         .map(|entry| {
@@ -1011,8 +1030,9 @@ pub(crate) fn copy_cfb_with_replacement(
             continue;
         }
         if is_stream {
-            let data = if name.trim_start_matches('/') == replaced_stream {
-                replacement.to_vec()
+            let key = name.trim_start_matches('/');
+            let data = if let Some(replacement) = replacements.get(key) {
+                replacement.clone()
             } else {
                 let mut stream = source
                     .open_stream(&path)
