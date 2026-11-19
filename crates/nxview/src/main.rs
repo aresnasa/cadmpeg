@@ -220,9 +220,34 @@ fn main() -> anyhow::Result<()> {
                 .iter()
                 .map(|loss| format!("{:?}: {}", loss.severity, loss.message))
                 .collect();
+            let loss_codes = &result.report().losses;
+            let document_kind = if loss_codes
+                .iter()
+                .any(|loss| loss.code.local_code() == "container.simulation-motion")
+            {
+                "motion-simulation"
+            } else if loss_codes
+                .iter()
+                .any(|loss| loss.code.local_code() == "container.simulation-cae")
+            {
+                "cae-simulation"
+            } else if loss_codes
+                .iter()
+                .any(|loss| loss.code.local_code() == "container.cae-fem")
+            {
+                "cae-fem"
+            } else if loss_codes
+                .iter()
+                .any(|loss| loss.code.local_code() == "assembly.components-external")
+            {
+                "assembly"
+            } else {
+                "part"
+            };
             let value = json!({
                 "path": path.display().to_string(),
                 "container": container_kind(&path),
+                "document_kind": document_kind,
                 "bodies": ir.model.bodies.len(),
                 "regions": ir.model.regions.len(),
                 "shells": ir.model.shells.len(),

@@ -276,6 +276,22 @@ impl<'a> Container<'a> {
         false
     }
 
+    /// Bytes of the first catalogued stream whose name ends with `suffix`.
+    ///
+    /// Used for document-domain probes (`UG_PART/UG_PART`) that must inspect
+    /// the raw payload before the native model is built.
+    pub(crate) fn entry_bytes_ending(&self, suffix: &str) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|entry| entry.name.ends_with(suffix))
+            .and_then(|entry| {
+                let (start, byte_len) = entry.file_span()?;
+                let start = usize::try_from(start).ok()?;
+                let byte_len = usize::try_from(byte_len).ok()?;
+                self.data.get(start..start.checked_add(byte_len)?)
+            })
+    }
+
     /// Return an absolute source span only when it is wholly owned by one
     /// catalogued directory entry.
     pub(crate) fn bounded_entry_bytes(&self, offset: u64, byte_len: u64) -> Option<&[u8]> {

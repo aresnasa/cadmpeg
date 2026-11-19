@@ -112,6 +112,14 @@ loss_codes! {
     NonParasolidStreamOmitted => ("stream.non-parasolid-omitted", Info, PassthroughRecordOmitted),
     /// Assembly `.prt` has no inline geometry; children live in external parts.
     AssemblyComponentsExternal => ("assembly.components-external", Blocking, AssemblyComponentsExternal),
+    /// NX Motion `.sim` container; the rigid-body model and results live in
+    /// companion `.rmd`/`.rplt` files.
+    SimulationContainerMotion => ("container.simulation-motion", Info, DecodeDiagnostic),
+    /// NX CAE `.sim` container; the FE model lives in OM/FEM data.
+    SimulationContainerCae => ("container.simulation-cae", Info, DecodeDiagnostic),
+    /// NX CAE `.fem` container; mesh, material and solution data are not part
+    /// of the B-rep geometry decoder.
+    CaeFemContainer => ("container.cae-fem", Info, DecodeDiagnostic),
     /// A carrier record of the right family states lanes the IR carrier refuses.
     CarrierLanesUnpaired => ("carrier.lanes-unpaired", Warning, ObjectRecordsUntransferred),
     /// A `SWEPT_SURF` finite sweep interval was inferred from adjacent face vertices.
@@ -224,6 +232,9 @@ mod tests {
                 "container.stream-opaque",
                 "stream.non-parasolid-omitted",
                 "assembly.components-external",
+                "container.simulation-motion",
+                "container.simulation-cae",
+                "container.cae-fem",
                 "carrier.lanes-unpaired",
                 "surface.swept-domain-inferred",
                 "surface.swept-profile-unverified",

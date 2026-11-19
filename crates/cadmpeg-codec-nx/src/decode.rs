@@ -300,27 +300,106 @@ fn build_metadata_ir(
     Ok((ir, annotations.build(), unknowns, losses))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerDomain {
+    Part,
+    Assembly,
+    MotionSimulation,
+    CaeSimulation,
+    CaeFem,
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn bytes_count(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+/// Classify a container before geometry is built.
+///
+/// NX writes assemblies, Motion simulations and CAE simulations/finite-element
+/// models with the same `UG_PART` container envelope.  The extension is not
+/// available to the decoder, so the document domain comes from the OM payload:
+/// CAE templates carry `CaeSim`/`CaeFem`; Motion scenarios carry many
+/// `Motion`/`motion_` names; assemblies carry external references without
+/// inline Parasolid data.
+fn container_domain(scan: &Scan<'_>) -> ContainerDomain {
+    if let Some(bytes) = scan.container.entry_bytes_ending("UG_PART/UG_PART") {
+        let cae_simulation = bytes_count(bytes, b"CaeSim") > 0;
+        let cae_fem = bytes_count(bytes, b"CaeFem");
+        let motion = bytes_contain(bytes, b"Mdm mechanism")
+            || bytes_contain(bytes, b"Mdm joint")
+            || bytes_contain(bytes, b"Mdm link")
+            || bytes_count(bytes, b"Motion") > 10
+            || bytes_count(bytes, b"motion_") > 5;
+        // A Motion `.sim` saved by NX 2606 still contains two boilerplate
+        // `CaeFem` names.  Prefer Motion when the CAE markers are only
+        // boilerplate; a real CAE `.sim` carries many `CaeSim` names and a
+        // `.fem` carries hundreds of `CaeFem` names.
+        if cae_simulation {
+            return ContainerDomain::CaeSimulation;
+        }
+        if cae_fem > 10 {
+            return ContainerDomain::CaeFem;
+        }
+        if motion {
+            return ContainerDomain::MotionSimulation;
+        }
+        if cae_fem > 0 {
+            return ContainerDomain::CaeFem;
+        }
+    }
+    if scan.container.has_external_references() && !scan.has_parasolid() {
+        ContainerDomain::Assembly
+    } else {
+        ContainerDomain::Part
+    }
+}
+
 fn build_container_body(
     scan: &Scan,
     dialect_losses: Vec<LossNote>,
     notes: Vec<String>,
 ) -> cadmpeg_ir::codec::DecodeBody {
-    let assembly = scan.container.has_external_references() && !scan.has_parasolid();
-
-    let loss = if assembly {
-        NxLossCode::AssemblyComponentsExternal.note(
+    let loss = match container_domain(scan) {
+        ContainerDomain::Assembly => NxLossCode::AssemblyComponentsExternal.note(
             "No inline Parasolid geometry: this is an assembly .prt. Component geometry \
                       lives in external child .prt files named in EXTREFSTREAM, and the assembled \
                       solid's inputs (child partitions + constraint solve) are absent from this \
                       file. This is an external-dependency boundary, not a decode gap.",
-        )
-    } else {
-        NxLossCode::GeometryNotTransferred.note(
+        ),
+        ContainerDomain::MotionSimulation => NxLossCode::SimulationContainerMotion.note(
+            "This is an NX Motion simulation container, not an assembly or B-rep part. \
+             The rigid-body model, solver log and result channels live in companion \
+             .rmd/.msg/.rplt/.rad files; the .sim file has no inline Parasolid geometry.",
+        ),
+        ContainerDomain::CaeSimulation => NxLossCode::SimulationContainerCae.note(
+            "This is an NX CAE simulation container. The finite-element model and \
+             solution data live in the CAE OM/FEM payload; the .sim file has no inline \
+             Parasolid B-rep geometry.",
+        ),
+        ContainerDomain::CaeFem => NxLossCode::CaeFemContainer.note(
+            "This is an NX CAE finite-element model. Mesh, material and boundary \
+             condition data are CAE payloads and are not transferred by the part-geometry \
+             decoder.",
+        ),
+        ContainerDomain::Part => NxLossCode::GeometryNotTransferred.note(
             "No B-rep geometry was transferred: no gate-passing analytic carrier was found \
                       in the embedded Parasolid streams (they may hold only B-spline/procedural \
                       geometry this codec does not yet type). The streams are preserved verbatim as \
                       unknown passthrough records.",
-        )
+        ),
     };
 
     let mut body = DecodeBody {
