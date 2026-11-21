@@ -26,6 +26,7 @@ mod assembly_mesh;
 mod cam;
 mod motion;
 mod motion_model;
+mod motion_ui;
 mod scene;
 
 #[derive(Default)]
@@ -174,6 +175,9 @@ fn main() -> anyhow::Result<()> {
         }
         "motion" => {
             motion_command(&mut args)?;
+        }
+        "motion-ui" => {
+            motion_ui::command(&mut args)?;
         }
         "rad" => {
             let path = PathBuf::from(args.next().context("usage: nxview rad <file.rad>")?);
@@ -2107,6 +2111,10 @@ fn write_obj(path: &Path, mesh: &MeshData) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One standard Windows wheel notch as reported by minifb (`120 * 0.1`).
+#[cfg(any(feature = "viewer", test))]
+const WHEEL_NOTCH: f32 = 12.0;
+
 #[cfg(any(feature = "viewer", test))]
 #[derive(Clone, Copy)]
 struct CameraState {
@@ -2150,7 +2158,15 @@ impl CameraState {
     }
 
     fn zoom(&mut self, scroll: f32, extent: f32) {
-        self.distance = (self.distance * (1.0 - scroll * 0.12)).clamp(extent * 0.05, extent * 50.0);
+        // minifb reports one 120-unit wheel notch as 12.0.  Normalise to
+        // notches and cap a single event so a high-resolution touchpad or a
+        // fast wheel burst cannot jump straight to the near clip limit.
+        let notches = (scroll / WHEEL_NOTCH).clamp(-3.0, 3.0);
+        if notches.abs() < 1e-4 {
+            return;
+        }
+        let factor = 1.12_f32.powf(-notches);
+        self.distance = (self.distance * factor).clamp(extent * 0.05, extent * 50.0);
     }
 }
 
@@ -3282,7 +3298,7 @@ fn view_bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3], [f32; 3]) {
 
 #[cfg(test)]
 mod interactive_tests {
-    use super::CameraState;
+    use super::{CameraState, WHEEL_NOTCH};
     use glam::Vec3;
 
     fn camera() -> CameraState {
@@ -3304,12 +3320,27 @@ mod interactive_tests {
     }
 
     #[test]
+    fn one_wheel_notch_is_a_small_zoom_step() {
+        let mut camera = camera();
+        let before = camera.distance;
+        camera.zoom(WHEEL_NOTCH, 100.0);
+        assert!((camera.distance - before / 1.12).abs() < 1e-4);
+        assert!(camera.distance > 5.0);
+        camera.zoom(-WHEEL_NOTCH, 100.0);
+        assert!((camera.distance - before).abs() < 1e-4);
+    }
+
+    #[test]
     fn zoom_stays_inside_fit_limits() {
         let mut camera = camera();
-        camera.zoom(1000.0, 100.0);
-        assert!((camera.distance - 5.0).abs() < 1e-4);
-        camera.zoom(-1000.0, 100.0);
-        assert!((camera.distance - 605.0).abs() < 1e-2);
+        for _ in 0..200 {
+            camera.zoom(WHEEL_NOTCH, 100.0);
+        }
+        assert!((camera.distance - 5.0).abs() < 1e-3);
+        for _ in 0..200 {
+            camera.zoom(-WHEEL_NOTCH, 100.0);
+        }
+        assert!((camera.distance - 5000.0).abs() < 1e-2);
     }
 
     #[test]
